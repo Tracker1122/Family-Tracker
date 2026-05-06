@@ -2089,9 +2089,17 @@ const GoogleAuth = (function() {
 //     }
 //   }
 //
-// Concurrency: ETag-based optimistic locking. We capture the ETag from
-// every successful read/write, send it as If-Match on writes. On 412
-// (Precondition Failed), surface a toast — user must reload.
+// Concurrency: version-based optimistic locking. Drive's `version` field
+// (a monotonically-increasing string in the file's JSON metadata) increments
+// on every modification. We capture it on read, then on write: GET current
+// version, compare to ours, abort if changed, otherwise PATCH.
+//
+// Why version instead of ETag? Drive returns ETag in response headers,
+// but Google's CORS policy doesn't expose those headers to browser JS,
+// so etag was always null in our reads. Verified empirically in Phase 5
+// testing. The `version` field is in the response *body*, which CORS
+// can't strip. Costs one extra HTTP per write (the version check), which
+// is acceptable.
 //
 // Offline: writes mirror to localStorage as a cache. On network fail,
 // reads come from the cache. Writes that fail enter a "queued" state and
@@ -2123,7 +2131,7 @@ function setDriveFileId(id) {
 
 const DriveBackend = (function() {
   let cache = null;
-  let etag = null;
+  let version = null;        // Drive's monotonic version field. null until first read.
   let writeTimer = null;
   let writeInFlight = false;
   let pendingWrite = false;
@@ -2136,7 +2144,7 @@ const DriveBackend = (function() {
         const parsed = JSON.parse(raw);
         if (parsed && parsed.data) {
           cache = parsed.data;
-          etag = parsed.etag || null;
+          version = parsed.version || null;
           console.log('[DriveBackend] loaded cache from localStorage');
         }
       }
@@ -2147,10 +2155,28 @@ const DriveBackend = (function() {
 
   function persistCache() {
     try {
-      localStorage.setItem('family-' + DRIVE_CACHE_KEY, JSON.stringify({ etag, data: cache }));
+      localStorage.setItem('family-' + DRIVE_CACHE_KEY, JSON.stringify({ version, data: cache }));
     } catch(e) {
       console.warn('[DriveBackend] cache persist failed', e.message);
     }
+  }
+
+  // Fetch the current version of the Drive file. Lightweight metadata-only call.
+  // Returns the version string (e.g. "73714") or throws on auth/network error.
+  async function fetchDriveVersion() {
+    const fileId = getDriveFileId();
+    if (!fileId) throw new Error('no Drive file ID configured');
+    const token = GoogleAuth.getToken();
+    if (!token) throw new Error('not authenticated');
+    const url = `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?fields=version`;
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    if (resp.status === 401) { setSyncState('authNeeded'); throw new Error('401 unauthorized'); }
+    if (!resp.ok) throw new Error('Drive metadata fetch failed: ' + resp.status);
+    const meta = await resp.json();
+    return meta.version || null;
   }
 
   async function pullFromDrive() {
@@ -2159,29 +2185,33 @@ const DriveBackend = (function() {
     const token = GoogleAuth.getToken();
     if (!token) throw new Error('not authenticated');
 
-    const url = `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?alt=media`;
-    const resp = await fetch(url, {
-      method: 'GET',
-      headers: { 'Authorization': 'Bearer ' + token }
-    });
-    if (resp.status === 401) { setSyncState('authNeeded'); throw new Error('401 unauthorized'); }
-    if (resp.status === 404) { throw new Error('Drive file not found (id may be stale or deleted)'); }
-    if (!resp.ok) { throw new Error('Drive read failed: ' + resp.status); }
+    // Fetch content and version metadata in parallel — saves one round-trip latency.
+    const contentUrl = `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?alt=media`;
+    const [contentResp, newVersion] = await Promise.all([
+      fetch(contentUrl, {
+        method: 'GET',
+        headers: { 'Authorization': 'Bearer ' + token }
+      }),
+      fetchDriveVersion()
+    ]);
 
-    const newEtag = resp.headers.get('ETag') || resp.headers.get('etag');
-    const text = await resp.text();
+    if (contentResp.status === 401) { setSyncState('authNeeded'); throw new Error('401 unauthorized'); }
+    if (contentResp.status === 404) { throw new Error('Drive file not found (id may be stale or deleted)'); }
+    if (!contentResp.ok) { throw new Error('Drive read failed: ' + contentResp.status); }
+
+    const text = await contentResp.text();
     let parsed;
     try { parsed = JSON.parse(text); }
     catch(e) { throw new Error('Drive file content is not valid JSON: ' + e.message); }
 
     cache = parsed.data || {};
-    etag = newEtag;
+    version = newVersion;
     persistCache();
 
     if (parsed.lastEditedBy && parsed.lastEditedAt) {
       setLastEdited(parsed.lastEditedBy, parsed.lastEditedAt);
     }
-    console.log('[DriveBackend] ✓ pulled from Drive, etag=', etag);
+    console.log('[DriveBackend] ✓ pulled from Drive, version=', version);
     return parsed;
   }
 
@@ -2190,6 +2220,18 @@ const DriveBackend = (function() {
     if (!fileId) throw new Error('no Drive file ID configured');
     const token = GoogleAuth.getToken();
     if (!token) throw new Error('not authenticated');
+
+    // Version-based optimistic concurrency: check current version before writing.
+    // If the remote version doesn't match what we last saw, someone else edited
+    // the file. Abort with conflict toast.
+    if (version !== null) {
+      const currentVersion = await fetchDriveVersion();
+      if (currentVersion !== version) {
+        console.warn('[DriveBackend] version mismatch: ours=', version, 'remote=', currentVersion);
+        showConflictToast();
+        throw new Error('412 conflict — remote version changed (was ' + version + ', now ' + currentVersion + ')');
+      }
+    }
 
     const body = JSON.stringify({
       schemaVersion: 1,
@@ -2203,25 +2245,25 @@ const DriveBackend = (function() {
       'Authorization': 'Bearer ' + token,
       'Content-Type': 'application/json'
     };
-    if (etag) headers['If-Match'] = etag;
 
     const resp = await fetch(url, { method: 'PATCH', headers, body });
 
     if (resp.status === 401) { setSyncState('authNeeded'); throw new Error('401 unauthorized'); }
-    if (resp.status === 412) {
-      showConflictToast();
-      throw new Error('412 conflict — remote was edited');
-    }
     if (!resp.ok) {
       const errText = await resp.text().catch(() => '');
       throw new Error('Drive write failed: ' + resp.status + ' ' + errText.slice(0, 200));
     }
 
-    const newEtag = resp.headers.get('ETag') || resp.headers.get('etag');
-    etag = newEtag;
+    // After write: fetch new version so subsequent writes can compare.
+    try {
+      version = await fetchDriveVersion();
+    } catch(e) {
+      console.warn('[DriveBackend] post-write version fetch failed:', e.message);
+      version = null;  // force fresh pull next time
+    }
     persistCache();
     setLastEdited(getDisplayName() || 'You', new Date().toISOString());
-    console.log('[DriveBackend] ✓ pushed to Drive, new etag=', etag);
+    console.log('[DriveBackend] ✓ pushed to Drive, new version=', version);
   }
 
   async function get(key) {
@@ -2278,8 +2320,9 @@ const DriveBackend = (function() {
       console.warn('[DriveBackend] write error:', e.message);
       if (/401/.test(e.message)) {
         setSyncState('authNeeded');
-      } else if (/412/.test(e.message)) {
-        setSyncState('synced');
+      } else if (/412 conflict/.test(e.message)) {
+        // Conflict — toast already fired in pushToDrive
+        setSyncState('synced');  // not "syncing" anymore; user has to act
       } else {
         setSyncState('offline');
         queuedForRetry = true;
@@ -2300,7 +2343,7 @@ const DriveBackend = (function() {
 
   function reset() {
     cache = null;
-    etag = null;
+    version = null;
     clearTimeout(writeTimer);
     writeInFlight = false;
     pendingWrite = false;
@@ -2311,10 +2354,11 @@ const DriveBackend = (function() {
   return {
     get, set, remove, backendName,
     pullFromDrive, pushToDrive, flushNow, reset, initFromCache,
+    fetchDriveVersion,
     _debug: {
       getCache: () => cache,
-      getEtag: () => etag,
-      setEtag: (v) => { etag = v; },
+      getVersion: () => version,
+      setVersion: (v) => { version = v; },
       isWriteInFlight: () => writeInFlight,
       isQueuedForRetry: () => queuedForRetry
     }
@@ -2368,10 +2412,9 @@ async function createDriveFile() {
     const err = await writeResp.text().catch(() => '');
     throw new Error('initial write failed: ' + writeResp.status + ' ' + err.slice(0, 200));
   }
-  const initialEtag = writeResp.headers.get('ETag') || writeResp.headers.get('etag');
 
-  console.log('[Drive] ✓ created file', fileId, 'etag=', initialEtag);
-  return { fileId, etag: initialEtag, name: DRIVE_FILE_NAME };
+  console.log('[Drive] ✓ created file', fileId);
+  return { fileId, name: DRIVE_FILE_NAME };
 }
 
 // ─────────────────────────────────────────────
@@ -2677,7 +2720,7 @@ async function devsyncCreateFile() {
     // Activate DriveBackend with the new file
     DriveBackend.reset();
     setActiveBackend(DriveBackend);
-    // Pull initial empty content to populate cache + capture etag
+    // Pull initial empty content to populate cache + capture version
     await DriveBackend.pullFromDrive();
     devsyncStatus('✓ File created. ID: ' + result.fileId.slice(0, 12) + '…  DriveBackend active.', 'ok');
   } catch(e) {
@@ -2734,13 +2777,13 @@ async function devsyncReadFromDrive() {
 
 function devsyncShowCache() {
   const cache = DriveBackend._debug.getCache();
-  const etag = DriveBackend._debug.getEtag();
+  const version = DriveBackend._debug.getVersion();
   console.log('[devsync] in-memory cache:', cache);
-  console.log('[devsync] etag:', etag);
+  console.log('[devsync] version:', version);
   if (cache === null) {
     devsyncStatus('Cache is null (no read happened yet).', 'info');
   } else {
-    devsyncStatus('Cache logged to console. Keys: ' + Object.keys(cache).join(', ') + '. etag: ' + (etag || 'none'), 'ok');
+    devsyncStatus('Cache logged to console. Keys: ' + Object.keys(cache).join(', ') + '. version: ' + (version || 'none'), 'ok');
   }
 }
 
@@ -2754,14 +2797,15 @@ async function devsyncForceConflict() {
     return;
   }
   try {
-    devsyncStatus('Forcing 412 by stale ETag…');
-    // Manually set the etag to a known-bad value, then attempt write
-    DriveBackend._debug.setEtag('"this-is-an-intentionally-wrong-etag"');
+    devsyncStatus('Forcing conflict by stale version…');
+    // Plant a known-bad version. pushToDrive will fetch the real current
+    // version, see they don't match, and abort with a conflict.
+    DriveBackend._debug.setVersion('999999999');
     await DriveBackend.set('positions-v2', JSON.stringify({ _conflictTest: Date.now() }));
     await DriveBackend.flushNow();
-    devsyncStatus('Hmm — write succeeded; expected 412. Drive may not be enforcing If-Match.', 'fail');
+    devsyncStatus('Hmm — write succeeded; expected conflict. Bug?', 'fail');
   } catch(e) {
-    if (/412/.test(e.message)) {
+    if (/conflict/.test(e.message)) {
       devsyncStatus('✓ Conflict detected as expected. Toast should be visible.', 'ok');
     } else {
       devsyncStatus('✗ Got a different error: ' + e.message, 'fail');
