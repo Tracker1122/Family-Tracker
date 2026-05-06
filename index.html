@@ -1643,8 +1643,8 @@ document.addEventListener('keydown', (e) => {
 //   - API Key is restricted to HTTP referrers (same origins) + Picker API only
 // Google explicitly sanctions exposing these in client-side code.
 // ─────────────────────────────────────────────
-const GOOGLE_OAUTH_CLIENT_ID = '{"web":{"client_id":"399383645070-g5nqc74hlih2aan584mfksge38hp27nn.apps.googleusercontent.com","project_id":"family-tracker-495423","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","auth_provider_x509_cert_url":"https://www.googleapis.com/oauth2/v1/certs","client_secret":"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","javascript_origins":["http://localhost","https://tracker1122.github.io"]}}';
-const GOOGLE_API_KEY = 'AIzaSyCjFVTN2-BGh97jfNqJuMd44x5JCFsGfuo';
+const GOOGLE_OAUTH_CLIENT_ID = 'PASTE_OAUTH_CLIENT_ID_HERE';
+const GOOGLE_API_KEY = 'PASTE_API_KEY_HERE';
 
 // ─────────────────────────────────────────────
 // GoogleAuth module — OAuth implicit flow via Google Identity Services.
@@ -1698,7 +1698,7 @@ const GoogleAuth = (function() {
     if (initPromise) return initPromise;
     initPromise = (async () => {
       // Validate that credentials were filled in
-      if (GOOGLE_OAUTH_CLIENT_ID === '{"web":{"client_id":"399383645070-g5nqc74hlih2aan584mfksge38hp27nn.apps.googleusercontent.com","project_id":"family-tracker-495423","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","auth_provider_x509_cert_url":"https://www.googleapis.com/oauth2/v1/certs","client_secret":"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","javascript_origins":["http://localhost","https://tracker1122.github.io"]}}' || !GOOGLE_OAUTH_CLIENT_ID) {
+      if (GOOGLE_OAUTH_CLIENT_ID === 'PASTE_OAUTH_CLIENT_ID_HERE' || !GOOGLE_OAUTH_CLIENT_ID) {
         throw new Error('GOOGLE_OAUTH_CLIENT_ID not configured. Edit index.html and paste your OAuth Client ID.');
       }
       await waitForGIS();
