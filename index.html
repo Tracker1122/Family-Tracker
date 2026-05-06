@@ -691,6 +691,11 @@
       <span id="sync-indicator-label">Local only</span>
     </div>
     <span id="last-edited" class="last-edited hidden"></span>
+    <!-- Phase 3 dev-mode test buttons. Hidden by default. Shown only when
+         URL contains ?devauth=1. Removed in Phase 4 once real wizard exists. -->
+    <button id="devauth-signin" class="btn btn-sm" onclick="GoogleAuth.signIn()" style="display:none">🧪 Sign in (test)</button>
+    <button id="devauth-signout" class="btn btn-sm" onclick="GoogleAuth.signOut()" style="display:none">🧪 Sign out (test)</button>
+    <span id="devauth-status" style="display:none;font-size:10px;color:var(--color-text-tertiary)"></span>
     <span id="save-note-inline" style="font-size:10px;color:var(--color-text-tertiary);opacity:0;transition:opacity 0.3s;">Saved</span>
     <button class="btn btn-sm" onclick="addPosition()">+ Add Position</button>
     <button class="btn btn-sm" onclick="exportData()" style="margin-right:4px">⬇ Export Data</button>
@@ -1424,6 +1429,11 @@
   <div id="undo-toast-bar" style="width:100%"></div>
 </div>
 
+<!-- Google Identity Services — handles OAuth implicit flow. Loads async,
+     populates window.google.accounts.oauth2 once ready. GoogleAuth.init()
+     waits for it. -->
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+
 <script>
 // ─────────────────────────────────────────────
 // State
@@ -1619,6 +1629,208 @@ document.addEventListener('keydown', (e) => {
     console.log('[dev] sync state →', next);
   }
 });
+
+// ─────────────────────────────────────────────
+// Google credentials — REQUIRED before OAuth will work.
+//
+// SETUP: Replace the two placeholder strings below with your real values.
+// Keep the quotes. The values come from your Google Cloud Console:
+//   1. OAuth Client ID — APIs & Services → Credentials → OAuth 2.0 Client IDs
+//   2. API Key         — APIs & Services → Credentials → API Keys
+//
+// Both are safe to commit publicly because:
+//   - OAuth Client ID is restricted to authorized origins (localhost, GH Pages)
+//   - API Key is restricted to HTTP referrers (same origins) + Picker API only
+// Google explicitly sanctions exposing these in client-side code.
+// ─────────────────────────────────────────────
+const GOOGLE_OAUTH_CLIENT_ID = 'PASTE_OAUTH_CLIENT_ID_HERE';
+const GOOGLE_API_KEY = 'PASTE_API_KEY_HERE';
+
+// ─────────────────────────────────────────────
+// GoogleAuth module — OAuth implicit flow via Google Identity Services.
+//
+// Phase 3: authentication only. No Drive calls yet — that's Phase 5.
+//
+// Token lifecycle:
+//   - Stored in JS memory only. Never in localStorage. Tab close = gone.
+//   - Expires after ~1 hour (Google-controlled). We track expiry and flip
+//     syncState → authNeeded when it hits, so the indicator turns red and
+//     becomes clickable to re-auth.
+//   - signIn() pops the consent screen if needed, otherwise re-issues silently.
+//
+// Scope:
+//   - drive.file ONLY — per-file access, no broad Drive read.
+//   - No userinfo.profile (keeps consent screen clean).
+//   - This means no Google profile name; display name is manual (Phase 4).
+//
+// Browser quirks:
+//   - The popup is gated behind direct user click. Don't auto-call signIn()
+//     on page load; it'll be blocked. Only call from event handlers.
+// ─────────────────────────────────────────────
+const GOOGLE_DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+
+const GoogleAuth = (function() {
+  let tokenClient = null;     // GIS token client instance
+  let accessToken = null;     // current access token (string), or null
+  let expiresAt = 0;          // unix ms when current token expires; 0 if none
+  let expiryTimer = null;     // setTimeout handle for expiry callback
+  let initPromise = null;     // resolves once GIS script + tokenClient are ready
+  let expiryCallbacks = [];   // fns to fire when token expires
+
+  // Wait for window.google.accounts.oauth2 to load. The GIS script is async,
+  // so it may not be ready when this module loads. Poll until it is.
+  function waitForGIS() {
+    return new Promise((resolve, reject) => {
+      const start = Date.now();
+      (function check() {
+        if (window.google && window.google.accounts && window.google.accounts.oauth2) {
+          return resolve();
+        }
+        if (Date.now() - start > 10000) {
+          return reject(new Error('Google Identity Services failed to load (10s timeout)'));
+        }
+        setTimeout(check, 100);
+      })();
+    });
+  }
+
+  function init() {
+    if (initPromise) return initPromise;
+    initPromise = (async () => {
+      // Validate that credentials were filled in
+      if (GOOGLE_OAUTH_CLIENT_ID === 'PASTE_OAUTH_CLIENT_ID_HERE' || !GOOGLE_OAUTH_CLIENT_ID) {
+        throw new Error('GOOGLE_OAUTH_CLIENT_ID not configured. Edit index.html and paste your OAuth Client ID.');
+      }
+      await waitForGIS();
+      tokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: GOOGLE_OAUTH_CLIENT_ID,
+        scope: GOOGLE_DRIVE_SCOPE,
+        prompt: '',  // '' = show consent only when needed; '' is the default for re-auth
+        callback: handleTokenResponse,
+        error_callback: handleTokenError
+      });
+      console.log('[GoogleAuth] initialized');
+    })();
+    return initPromise;
+  }
+
+  function handleTokenResponse(resp) {
+    if (resp.error) {
+      console.warn('[GoogleAuth] token response error:', resp.error, resp.error_description || '');
+      setSyncState('authNeeded');
+      updateDevAuthStatus();
+      return;
+    }
+    accessToken = resp.access_token;
+    // expires_in is in seconds. Subtract 60s buffer so we re-auth before actual expiry.
+    const expiresInMs = ((parseInt(resp.expires_in, 10) || 3600) - 60) * 1000;
+    expiresAt = Date.now() + expiresInMs;
+    scheduleExpiryCallback(expiresInMs);
+    console.log('[GoogleAuth] ✓ signed in, token expires in ~' + Math.round(expiresInMs / 1000) + 's');
+    updateDevAuthStatus();
+    // NOTE: we do NOT flip syncState to 'synced' here. That happens in Phase 5
+    // after a real Drive operation succeeds. For now, the token exists but
+    // there's no Drive backend yet, so syncState stays where it was.
+  }
+
+  function handleTokenError(err) {
+    // Fires when user cancels the popup, popup blocked, etc.
+    console.warn('[GoogleAuth] token error:', err);
+    updateDevAuthStatus();
+  }
+
+  function scheduleExpiryCallback(ms) {
+    clearTimeout(expiryTimer);
+    expiryTimer = setTimeout(() => {
+      console.log('[GoogleAuth] token expired');
+      accessToken = null;
+      expiresAt = 0;
+      setSyncState('authNeeded');
+      expiryCallbacks.forEach(fn => { try { fn(); } catch(e) { console.warn(e); } });
+      updateDevAuthStatus();
+    }, ms);
+  }
+
+  async function signIn() {
+    try {
+      await init();
+      // Triggers the popup. Result comes back via handleTokenResponse.
+      tokenClient.requestAccessToken();
+    } catch (e) {
+      console.warn('[GoogleAuth] signIn failed:', e.message);
+      alert('Sign-in setup error: ' + e.message);
+    }
+  }
+
+  function signOut() {
+    if (accessToken) {
+      // Best-effort revoke. Don't await — user doesn't need to wait for it.
+      google.accounts.oauth2.revoke(accessToken, () => {
+        console.log('[GoogleAuth] token revoked');
+      });
+    }
+    accessToken = null;
+    expiresAt = 0;
+    clearTimeout(expiryTimer);
+    setSyncState('localOnly');
+    updateDevAuthStatus();
+  }
+
+  function getToken() {
+    // Returns the token if still valid, else null.
+    if (!accessToken) return null;
+    if (Date.now() >= expiresAt) return null;
+    return accessToken;
+  }
+
+  function isSignedIn() {
+    return getToken() !== null;
+  }
+
+  function onTokenExpiry(fn) {
+    expiryCallbacks.push(fn);
+  }
+
+  // Dev-mode status display — only visible when ?devauth=1 in URL
+  function updateDevAuthStatus() {
+    const el = document.getElementById('devauth-status');
+    if (!el || el.style.display === 'none') return;
+    if (accessToken) {
+      const remainingMs = expiresAt - Date.now();
+      const remainingMin = Math.max(0, Math.round(remainingMs / 60000));
+      el.textContent = `✓ signed in · ${remainingMin}m left`;
+      el.style.color = 'var(--color-text-success)';
+    } else {
+      el.textContent = '○ not signed in';
+      el.style.color = 'var(--color-text-tertiary)';
+    }
+  }
+
+  return { init, signIn, signOut, getToken, isSignedIn, onTokenExpiry, _updateDevAuthStatus: updateDevAuthStatus };
+})();
+
+// Dev-mode UI: show test buttons if ?devauth=1 in URL.
+// Removed in Phase 4 once real setup wizard exists.
+(function setupDevAuth() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('devauth') !== '1') return;
+  const showWhenReady = () => {
+    const ids = ['devauth-signin', 'devauth-signout', 'devauth-status'];
+    ids.forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.style.display = '';
+    });
+    GoogleAuth._updateDevAuthStatus();
+    // Refresh the "Xm left" countdown every 30s
+    setInterval(() => GoogleAuth._updateDevAuthStatus(), 30000);
+    console.log('[dev] OAuth test buttons enabled (?devauth=1)');
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', showWhenReady);
+  } else {
+    showWhenReady();
+  }
+})();
 
 // Convenience wrappers for JSON values — most app data is JSON.
 async function storageGetJSON(key) {
