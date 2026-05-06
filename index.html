@@ -1634,11 +1634,11 @@
         </div>
       </div>
       <div class="modal-actions">
-        <button class="btn btn-primary" onclick="closeWizard()">Done</button>
+        <button class="btn btn-primary" onclick="wizardFinishCloudSetup()">Done</button>
       </div>
     </div>
 
-    <!-- ─── Screen 7: create-error (Phase 6) ─── -->
+    <!-- ─── Screen 7: create/pick error (Phase 6 / Phase 7) ─── -->
     <div id="wizard-screen-7-error" class="hidden">
       <div class="modal-title">Something went wrong</div>
       <div class="modal-subtitle">We couldn't finish setting up cloud sync.</div>
@@ -1647,7 +1647,38 @@
       </div>
       <div class="modal-actions">
         <button class="btn" onclick="wizardBack()">← Back</button>
-        <button class="btn btn-primary" onclick="wizardCreateFile()">Try again</button>
+        <button class="btn btn-primary" onclick="wizardRetry()">Try again</button>
+      </div>
+    </div>
+
+    <!-- ─── Screen 8: pick-replace-confirm (Phase 7) ─────────
+         Shown only when the user has non-trivial local data and is about
+         to replace it with the contents of a picked Drive file. -->
+    <div id="wizard-screen-8-pick-confirm" class="hidden">
+      <div class="modal-title">Replace local data?</div>
+      <div class="modal-subtitle">You have data on this device that will be replaced by the shared file.</div>
+      <div class="wizard-info-block wizard-info-warn">
+        <div class="wizard-info-title">What's on this device right now</div>
+        <div class="wizard-info-body" id="wizard-pick-confirm-summary" style="font-family:var(--font-mono);font-size:11px;line-height:1.7"></div>
+        <div class="wizard-info-body" style="margin-top:10px">
+          Opening the shared tracker will pull its contents and overwrite the data above. This is irreversible from inside the app.
+          <div style="margin-top:8px;font-size:10px;color:var(--color-text-tertiary)">
+            Tip: if you want to keep this device's data, cancel and use <strong>Export</strong> from the menu before continuing.
+          </div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" onclick="wizardBack()">← Back</button>
+        <button class="btn btn-primary" onclick="wizardPickFileConfirmedReplace()">Replace and continue</button>
+      </div>
+    </div>
+
+    <!-- ─── Screen 9: picking-in-progress (Phase 7) ───────── -->
+    <div id="wizard-screen-9-picking" class="hidden">
+      <div class="modal-title">Opening shared tracker…</div>
+      <div class="modal-subtitle" id="wizard-picking-status">Loading the file you picked…</div>
+      <div style="display:flex;align-items:center;justify-content:center;padding:20px 0">
+        <div style="width:32px;height:32px;border:3px solid var(--color-border-secondary);border-top-color:var(--color-text-info);border-radius:50%;animation:wizard-spin 1s linear infinite"></div>
       </div>
     </div>
   </div>
@@ -1685,6 +1716,7 @@
     <button class="btn btn-sm" onclick="devsyncShowCache()">5. Show in-memory cache</button>
     <button class="btn btn-sm btn-danger" onclick="devsyncForceConflict()">6. Force conflict (412 test)</button>
     <button class="btn btn-sm" onclick="devsyncFlushNow()">⚡ Flush write now (skip debounce)</button>
+    <button class="btn btn-sm" onclick="devsyncTestPick()">🗂 Test Picker (Phase 7)</button>
     <button class="btn btn-sm btn-danger" onclick="devsyncReset()">↺ Reset (clears file ID + cache)</button>
   </div>
   <div id="devsync-status" style="margin-top:8px;padding:6px 8px;background:var(--color-background-tertiary);border-radius:3px;font-size:10px;color:var(--color-text-secondary);min-height:32px;line-height:1.4">Ready. Click 1 first if not signed in, then 2, then 3-6 in any order.</div>
@@ -1694,6 +1726,11 @@
      populates window.google.accounts.oauth2 once ready. GoogleAuth.init()
      waits for it. -->
 <script src="https://accounts.google.com/gsi/client" async defer></script>
+
+<!-- Google API loader — required for the Picker (Phase 7).
+     Populates window.gapi. We then gapi.load('picker') on demand to pull in
+     google.picker.* . Only the pick path needs this; create path doesn't. -->
+<script src="https://apis.google.com/js/api.js" async defer></script>
 
 <script>
 // ─────────────────────────────────────────────
@@ -2113,6 +2150,138 @@ const GoogleAuth = (function() {
   }
 
   return { init, signIn, signOut, getToken, isSignedIn, onTokenExpiry, _updateDevAuthStatus: updateDevAuthStatus };
+})();
+
+// ─────────────────────────────────────────────
+// GooglePicker — wraps the Google Picker API for selecting an existing
+// family-tracker-data.json file from the user's Drive.
+//
+// Why Picker (and only Picker) for the open-existing path:
+//   We use drive.file scope, which only grants per-file access. The app
+//   cannot list or search Drive. The Picker is Google's sanctioned UI for
+//   the user to grant the app access to a specific file — the act of
+//   picking a file is what extends the drive.file grant to that file.
+//
+// API loading:
+//   apis.google.com/js/api.js exposes window.gapi. We then gapi.load('picker')
+//   on first use to pull in google.picker.*. Both are async; init() waits.
+//
+// Views:
+//   We show two DocsViews — Shared-with-me and My-Drive (owned-by-me).
+//   The Shared view covers the join-someone-else's-family case; My-Drive
+//   covers "I created the file on another device, lost localStorage, now
+//   on this device picking my own file."
+//
+// No MIME filter:
+//   Drive's labelling of JSON files isn't 100% predictable across upload
+//   paths. An empty Picker is a worse failure than a noisy one. We validate
+//   the picked file's contents after selection and bail with a clear error
+//   if it doesn't look like a family tracker.
+// ─────────────────────────────────────────────
+
+const GooglePicker = (function() {
+  let initPromise = null;
+
+  // Wait for window.gapi to populate. The api.js script is async/defer.
+  function waitForGapi() {
+    return new Promise((resolve, reject) => {
+      const start = Date.now();
+      (function check() {
+        if (window.gapi && typeof window.gapi.load === 'function') return resolve();
+        if (Date.now() - start > 10000) return reject(new Error('Google API loader (gapi) failed to load (10s timeout)'));
+        setTimeout(check, 100);
+      })();
+    });
+  }
+
+  // Wait for google.picker namespace after gapi.load('picker') resolves.
+  // Belt-and-braces — gapi.load's callback should fire when ready, but
+  // sequencing across async script loads sometimes leaves a small gap.
+  function waitForPickerNamespace() {
+    return new Promise((resolve, reject) => {
+      const start = Date.now();
+      (function check() {
+        if (window.google && window.google.picker && window.google.picker.PickerBuilder) return resolve();
+        if (Date.now() - start > 10000) return reject(new Error('google.picker namespace failed to populate (10s timeout)'));
+        setTimeout(check, 100);
+      })();
+    });
+  }
+
+  function init() {
+    if (initPromise) return initPromise;
+    initPromise = (async () => {
+      if (!GOOGLE_API_KEY || GOOGLE_API_KEY === 'PASTE_API_KEY_HERE') {
+        throw new Error('GOOGLE_API_KEY not configured. Edit index.html and paste your API Key.');
+      }
+      await waitForGapi();
+      // gapi.load takes a callback; promisify it.
+      await new Promise((resolve, reject) => {
+        try {
+          gapi.load('picker', { callback: resolve, onerror: () => reject(new Error('gapi.load(picker) failed')) });
+        } catch(e) { reject(e); }
+      });
+      await waitForPickerNamespace();
+      console.log('[GooglePicker] initialized');
+    })();
+    return initPromise;
+  }
+
+  // Show the Picker. Returns a Promise that resolves to one of:
+  //   { fileId, name, mimeType }  — user picked a file
+  //   null                        — user cancelled or closed the Picker
+  // Rejects on init / config errors only.
+  async function show() {
+    await init();
+    const token = GoogleAuth.getToken();
+    if (!token) throw new Error('not authenticated; sign in first');
+
+    return new Promise((resolve, reject) => {
+      try {
+        const sharedView = new google.picker.DocsView()
+          .setOwnedByMe(false)
+          .setIncludeFolders(false)
+          .setLabel('Shared with me');
+        const myDriveView = new google.picker.DocsView()
+          .setOwnedByMe(true)
+          .setIncludeFolders(false)
+          .setLabel('My Drive');
+
+        const builder = new google.picker.PickerBuilder()
+          .setOAuthToken(token)
+          .setDeveloperKey(GOOGLE_API_KEY)
+          .setTitle('Select your family-tracker-data.json file')
+          .addView(sharedView)
+          .addView(myDriveView)
+          .setCallback((data) => {
+            // Picker fires multiple callback events. We only care about PICKED and CANCEL.
+            const action = data[google.picker.Response.ACTION];
+            if (action === google.picker.Action.PICKED) {
+              const docs = data[google.picker.Response.DOCUMENTS];
+              if (!docs || docs.length === 0) return resolve(null);
+              const doc = docs[0];
+              resolve({
+                fileId: doc[google.picker.Document.ID],
+                name: doc[google.picker.Document.NAME],
+                mimeType: doc[google.picker.Document.MIME_TYPE]
+              });
+            } else if (action === google.picker.Action.CANCEL) {
+              resolve(null);
+            }
+            // Other actions (LOADED, etc.) — ignore.
+          });
+
+        // Optional: feature flags. NAV_HIDDEN would hide the navigation pane,
+        // which we don't want — user needs to switch between Shared and My Drive.
+        const picker = builder.build();
+        picker.setVisible(true);
+      } catch(e) {
+        reject(e);
+      }
+    });
+  }
+
+  return { init, show };
 })();
 
 // ─────────────────────────────────────────────
@@ -2635,7 +2804,24 @@ function openWizard() {
     nameInput.value = getDisplayName();
     updateNameContinueButton();
   }
+  // Reset the share screen to its create-path defaults. The pick-path
+  // mutates this screen at runtime to hide the share-with-family copy
+  // (since pick users don't need to re-share). Restore it here so a
+  // subsequent create flow shows the right content.
+  resetShareScreenToCreateDefaults();
   document.getElementById('setup-wizard-modal').classList.remove('hidden');
+}
+
+// Restore screen 6 to its as-authored markup. Called by openWizard so that
+// if the user runs through pick (which mutates the screen) and then later
+// re-opens the wizard for create, they see the create-flavor copy again.
+function resetShareScreenToCreateDefaults() {
+  const titleEl = document.querySelector('#wizard-screen-6-share .modal-title');
+  const subEl = document.querySelector('#wizard-screen-6-share .modal-subtitle');
+  const infoBlock = document.querySelector('#wizard-screen-6-share .wizard-info-block');
+  if (titleEl) titleEl.textContent = '✓ Cloud sync is on';
+  if (subEl) subEl.textContent = 'Your tracker now saves to Google Drive. One more thing — share the file with your family so they can edit too.';
+  if (infoBlock) infoBlock.style.display = '';
 }
 
 function closeWizard() {
@@ -2668,6 +2854,12 @@ function wizardBack() {
     } else {
       showWizardScreen('wizard-screen-3-pick');
     }
+    wizardCurrentScreen = 3;
+    return;
+  }
+  if (wizardCurrentScreen === 8) {
+    // From pick-confirm-replace screen, back to pick instructions
+    showWizardScreen('wizard-screen-3-pick');
     wizardCurrentScreen = 3;
     return;
   }
@@ -2790,13 +2982,14 @@ async function wizardCreateFile() {
   }
 }
 
-// Helper used by Phase 6 flows to switch to a single wizard screen.
+// Helper used by Phase 6/7 flows to switch to a single wizard screen.
 // Hides all other screens, shows the requested one.
 function showWizardScreen(screenId) {
   ['wizard-screen-1', 'wizard-screen-2', 'wizard-screen-3-create',
    'wizard-screen-3-pick', 'wizard-screen-3-local',
    'wizard-screen-4-placeholder', 'wizard-screen-5-creating',
-   'wizard-screen-6-share', 'wizard-screen-7-error']
+   'wizard-screen-6-share', 'wizard-screen-7-error',
+   'wizard-screen-8-pick-confirm', 'wizard-screen-9-picking']
     .forEach(id => {
       const el = document.getElementById(id);
       if (el) el.classList.add('hidden');
@@ -2810,18 +3003,252 @@ function setWizardCreatingStatus(msg) {
   if (el) el.textContent = msg;
 }
 
+// ─────────────────────────────────────────────
+// Phase 7: pick-existing-file flow.
+//
+// User journey:
+//   3-pick → "Sign in & pick file" → OAuth (if not signed in)
+//          → check local data → if non-trivial, screen 8 (replace confirm)
+//          → Picker opens → user picks → screen 9 (loading) → pullFromDrive
+//          → success: setup-status=cloud-configured, close wizard
+//          → failure: screen 7 (error) with path-aware retry
+// ─────────────────────────────────────────────
+
+// Stash for the picked file ID between the confirm screen and the actual
+// load step. Set by wizardPickFile (post-Picker), consumed by
+// wizardPickFileConfirmedReplace. Cleared after use.
+let _pickedFileForReplace = null;
+
+// Snapshot the local family-data keys for the "what's on this device" summary.
+// Returns { isEmpty, summary } — summary is human-readable lines for the UI.
+const FAMILY_DATA_KEYS = ['positions-v2', 'positions-closed', 'sp-data', 'ledger', 'snapshots-v1'];
+
+function summarizeLocalFamilyData() {
+  const counts = {};
+  let totalKeysWithData = 0;
+  for (const key of FAMILY_DATA_KEYS) {
+    let raw;
+    try { raw = localStorage.getItem('family-' + key); } catch(e) { raw = null; }
+    if (raw === null || raw === '') { counts[key] = 0; continue; }
+    try {
+      const parsed = JSON.parse(raw);
+      // Heuristic: count if it's an array (positions, snapshots, ledger entries),
+      // or if it's a non-empty object (sp-data: lots blob).
+      let n = 0;
+      if (Array.isArray(parsed)) n = parsed.length;
+      else if (parsed && typeof parsed === 'object') {
+        // For objects like sp-data, count it as 1 if there's any meaningful content.
+        n = Object.keys(parsed).length > 0 ? 1 : 0;
+      }
+      counts[key] = n;
+      if (n > 0) totalKeysWithData++;
+    } catch(e) {
+      counts[key] = 0;
+    }
+  }
+  // Map keys to human labels for the summary
+  const labels = {
+    'positions-v2': 'Open positions',
+    'positions-closed': 'Closed positions',
+    'sp-data': 'S&P 500 lots',
+    'ledger': 'Cash ledger entries',
+    'snapshots-v1': 'Saved snapshots'
+  };
+  const lines = FAMILY_DATA_KEYS
+    .filter(k => counts[k] > 0)
+    .map(k => `• ${labels[k]}: ${counts[k]}`);
+  return {
+    isEmpty: totalKeysWithData === 0,
+    summary: lines.join('<br>') || '(none)'
+  };
+}
+
+// Validate that a parsed JSON blob looks like a family tracker file.
+// Strict-ish: require a `data` object. Tolerate any schemaVersion so future
+// versions can still be opened (DriveBackend.pullFromDrive normalizes).
+function validateFamilyTrackerJSON(parsed) {
+  if (!parsed || typeof parsed !== 'object') return { ok: false, reason: 'file is not a JSON object' };
+  if (!('data' in parsed)) return { ok: false, reason: 'file is missing a "data" field — doesn\'t look like a family tracker' };
+  if (typeof parsed.data !== 'object' || parsed.data === null) return { ok: false, reason: 'file\'s "data" field is not an object' };
+  return { ok: true };
+}
+
+// Pull from Drive with retry-and-backoff on initial-after-pick failures.
+// drive.file scope + Picker is supposed to grant read access immediately
+// once the user picks the file, but this is empirically untested in this
+// codebase. If the first GET fails with 401/403/404, retry up to twice
+// with backoff. Any other error (network, JSON parse) is terminal —
+// retrying won't help and we'd just delay the error message.
+async function pullFromDriveWithBackoff() {
+  const delays = [500, 1500, 4000]; // ms; total ceiling ~6s
+  let lastError = null;
+  for (let attempt = 0; attempt < delays.length; attempt++) {
+    try {
+      return await DriveBackend.pullFromDrive();
+    } catch(e) {
+      lastError = e;
+      const msg = e.message || '';
+      const transient = /401|403|404/.test(msg);
+      console.warn(`[wizard.pick] pull attempt ${attempt + 1} failed:`, msg, transient ? '(transient — will retry)' : '(terminal)');
+      if (!transient) throw e;
+      if (attempt < delays.length - 1) {
+        await new Promise(r => setTimeout(r, delays[attempt]));
+      }
+    }
+  }
+  throw lastError || new Error('pullFromDrive failed after retries');
+}
+
 async function wizardPickFile() {
+  // Step 1: ensure we have an OAuth token
   if (!GoogleAuth.isSignedIn()) {
     GoogleAuth.signIn();
     const ok = await waitForToken(15000);
-    if (!ok) return;
+    if (!ok) {
+      // User cancelled or popup failed — stay on the pick screen
+      return;
+    }
   }
+
   setSetupStatus('pending-pick');
-  showPlaceholder(
-    'Sign-in worked — Picker coming in Phase 7',
-    'You\'re signed into Google. Phase 7 will wire up the Google Picker so you can choose a shared file. For now this just confirms OAuth handed off correctly.',
-    'OK'
-  );
+
+  // Step 2: open the Picker. show() resolves to {fileId,name,mimeType} or null.
+  let picked;
+  try {
+    picked = await GooglePicker.show();
+  } catch(e) {
+    console.warn('[wizard.pick] Picker init/show failed:', e.message);
+    showWizardScreen('wizard-screen-7-error');
+    document.getElementById('wizard-error-body').textContent =
+      'Couldn\'t open the Google Picker: ' + e.message + '. Your data is still safe locally.';
+    return;
+  }
+  if (!picked) {
+    // Cancel — leave user on the pick instructions screen, no error shown
+    console.log('[wizard.pick] user cancelled Picker');
+    return;
+  }
+
+  // Step 3: check for non-trivial local data. If present, route to confirm
+  // screen; otherwise proceed straight to load.
+  _pickedFileForReplace = picked;
+  const local = summarizeLocalFamilyData();
+  if (local.isEmpty) {
+    // No local data worth confirming — go straight to loading
+    return wizardPickFileConfirmedReplace();
+  }
+  // Show confirm-replace screen
+  document.getElementById('wizard-pick-confirm-summary').innerHTML = local.summary;
+  showWizardScreen('wizard-screen-8-pick-confirm');
+  wizardCurrentScreen = 8;
+}
+
+// Called from screen 8's "Replace and continue" button, or directly from
+// wizardPickFile when local data is empty.
+async function wizardPickFileConfirmedReplace() {
+  const picked = _pickedFileForReplace;
+  if (!picked || !picked.fileId) {
+    console.warn('[wizard.pick] no picked file in stash — bailing');
+    showWizardScreen('wizard-screen-3-pick');
+    wizardCurrentScreen = 3;
+    return;
+  }
+
+  showWizardScreen('wizard-screen-9-picking');
+  wizardCurrentScreen = 9;
+  setWizardPickingStatus('Loading the file you picked…');
+
+  try {
+    // Step 4: configure DriveBackend to point at the picked file
+    setDriveFileId(picked.fileId);
+    DriveBackend.reset();
+    setActiveBackend(DriveBackend);
+
+    // Step 5: pull initial state from Drive (with retry on transient errors).
+    setWizardPickingStatus('Pulling tracker data from Google Drive…');
+    let pulled;
+    try {
+      pulled = await pullFromDriveWithBackoff();
+    } catch(e) {
+      // Reset DriveBackend + clear file ID so we don't leave the app
+      // pointing at a file it can't read.
+      setDriveFileId(null);
+      DriveBackend.reset();
+      setActiveBackend(LocalStorageBackend);
+      throw e;
+    }
+
+    // Step 6: validate the file looks like a family tracker.
+    setWizardPickingStatus('Validating file…');
+    const validation = validateFamilyTrackerJSON(pulled);
+    if (!validation.ok) {
+      setDriveFileId(null);
+      DriveBackend.reset();
+      setActiveBackend(LocalStorageBackend);
+      throw new Error(validation.reason);
+    }
+
+    // Step 7: mark setup complete
+    setSetupStatus('cloud-configured');
+    setSyncState('synced');
+    _pickedFileForReplace = null;
+
+    // Step 8: close wizard. Caller's app reads from DriveBackend on next render.
+    // We don't show a share-with-family screen here because by definition
+    // the file was already shared with this user — they don't need to share
+    // it back. Just confirm and close.
+    showWizardScreen('wizard-screen-6-share');
+    // Tweak the share-screen copy for the pick-success case so it doesn't
+    // tell users to re-share a file that's already been shared with them.
+    const titleEl = document.querySelector('#wizard-screen-6-share .modal-title');
+    const subEl = document.querySelector('#wizard-screen-6-share .modal-subtitle');
+    const infoBlock = document.querySelector('#wizard-screen-6-share .wizard-info-block');
+    if (titleEl) titleEl.textContent = '✓ Connected to family tracker';
+    if (subEl) subEl.textContent = 'You\'re now editing the shared file. Changes sync to everyone with access.';
+    if (infoBlock) infoBlock.style.display = 'none';
+  } catch(e) {
+    console.warn('[wizard.pick] flow failed:', e.message);
+    _pickedFileForReplace = null;
+    showWizardScreen('wizard-screen-7-error');
+    wizardCurrentScreen = 7;
+    document.getElementById('wizard-error-body').textContent =
+      'Error: ' + e.message + '. Your data is still safe locally — try again or pick a different option.';
+  }
+}
+
+function setWizardPickingStatus(msg) {
+  const el = document.getElementById('wizard-picking-status');
+  if (el) el.textContent = msg;
+}
+
+// Path-aware retry. Screen 7's "Try again" button calls this so we retry
+// the right flow based on which path the user originally chose.
+function wizardRetry() {
+  if (wizardChosenPath === 'pick') {
+    wizardPickFile();
+  } else {
+    // Default to create — covers the original Phase 6 behavior.
+    wizardCreateFile();
+  }
+}
+
+// Path-aware finish. Screen 6's "Done" button calls this.
+//
+// For Create: in-memory app state already matches what got pushed to Drive,
+// so closing the wizard is enough. The user keeps working without disruption.
+//
+// For Pick: in-memory state is the user's old local data, but the active
+// backend now points at the picked file with completely different contents.
+// A reload is the simplest correct way to re-bootstrap from the new source.
+// Anything cleverer (re-running loadPositions etc) risks subtle inconsistencies
+// across modules that cached data at boot.
+function wizardFinishCloudSetup() {
+  if (wizardChosenPath === 'pick') {
+    closeWizard();
+    location.reload();
+  } else {
+    closeWizard();
+  }
 }
 
 function wizardConfirmLocal() {
@@ -3019,6 +3446,88 @@ async function devsyncFlushNow() {
     devsyncStatus('✓ Flush complete.', 'ok');
   } catch(e) {
     devsyncStatus('✗ Flush failed: ' + e.message, 'fail');
+  }
+}
+
+// Phase 7 diagnostic — open the Picker, pull from picked file, validate.
+// Doesn't change setup-status, doesn't reload, doesn't switch the active
+// backend permanently. Tests Picker integration in isolation.
+async function devsyncTestPick() {
+  if (!GoogleAuth.isSignedIn()) {
+    devsyncStatus('✗ Not signed in. Click step 1 first.', 'fail');
+    return;
+  }
+  // Stash current Drive state so we can restore after the test.
+  const prevFileId = getDriveFileId();
+  const prevBackendName = ActiveBackend.backendName();
+  const prevVersion = DriveBackend._debug.getVersion();
+
+  try {
+    devsyncStatus('Opening Picker…');
+    const picked = await GooglePicker.show();
+    if (!picked) {
+      devsyncStatus('Picker cancelled. No state changed.', 'ok');
+      return;
+    }
+    devsyncStatus(`Picked: ${picked.name} (id ${picked.fileId.slice(0, 12)}…). Pulling…`);
+
+    // Temporarily point DriveBackend at the picked file.
+    setDriveFileId(picked.fileId);
+    DriveBackend.reset();
+    setActiveBackend(DriveBackend);
+
+    let attempts = 0;
+    const startTime = Date.now();
+    let pulled;
+    try {
+      // Wrap pullFromDriveWithBackoff so we can count attempts visibly.
+      // Simple approach: just call the real one; logs show retry counts.
+      pulled = await pullFromDriveWithBackoff();
+    } catch(e) {
+      devsyncStatus('✗ Pull failed after retries: ' + e.message, 'fail');
+      // Restore previous state
+      setDriveFileId(prevFileId);
+      DriveBackend.reset();
+      if (prevBackendName === 'drive' && prevFileId) {
+        setActiveBackend(DriveBackend);
+        if (prevVersion) DriveBackend._debug.setVersion(prevVersion);
+      } else {
+        setActiveBackend(LocalStorageBackend);
+      }
+      return;
+    }
+    const elapsed = Date.now() - startTime;
+
+    const validation = validateFamilyTrackerJSON(pulled);
+    const dataKeys = pulled && pulled.data ? Object.keys(pulled.data) : [];
+    console.log('[devsync.testPick] pulled file:', pulled);
+
+    if (validation.ok) {
+      devsyncStatus(`✓ Pick OK in ${elapsed}ms. Keys: ${dataKeys.join(', ') || '(none)'}. lastEditedBy: ${pulled.lastEditedBy || 'n/a'}. State NOT permanently changed — restoring.`, 'ok');
+    } else {
+      devsyncStatus(`⚠ Pulled but validation failed: ${validation.reason}`, 'fail');
+    }
+
+    // Restore previous Drive state — this is a test, not a real switch.
+    setDriveFileId(prevFileId);
+    DriveBackend.reset();
+    if (prevBackendName === 'drive' && prevFileId) {
+      setActiveBackend(DriveBackend);
+      if (prevVersion) DriveBackend._debug.setVersion(prevVersion);
+    } else {
+      setActiveBackend(LocalStorageBackend);
+    }
+  } catch(e) {
+    devsyncStatus('✗ Picker error: ' + e.message, 'fail');
+    // Best-effort restore
+    setDriveFileId(prevFileId);
+    DriveBackend.reset();
+    if (prevBackendName === 'drive' && prevFileId) {
+      setActiveBackend(DriveBackend);
+      if (prevVersion) DriveBackend._debug.setVersion(prevVersion);
+    } else {
+      setActiveBackend(LocalStorageBackend);
+    }
   }
 }
 
