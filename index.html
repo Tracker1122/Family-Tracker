@@ -2336,9 +2336,47 @@ const DriveBackend = (function() {
     }
   }
 
+  // Force an immediate write, bypassing debounce. Returns the underlying
+  // promise; rejects if the write fails so callers (esp. diagnostics) can
+  // distinguish success from caught-and-swallowed errors.
   function flushNow() {
     clearTimeout(writeTimer);
-    return executeWrite();
+    return executeWriteAndPropagate();
+  }
+
+  // Like executeWrite but re-throws after handling state transitions.
+  // Used by flushNow so diagnostics can detect conflict / error states.
+  async function executeWriteAndPropagate() {
+    if (writeInFlight) {
+      pendingWrite = true;
+      return;
+    }
+    writeInFlight = true;
+    setSyncState('syncing');
+    let thrownError = null;
+    try {
+      await pushToDrive();
+      setSyncState('synced');
+      queuedForRetry = false;
+    } catch(e) {
+      thrownError = e;
+      console.warn('[DriveBackend] write error:', e.message);
+      if (/401/.test(e.message)) {
+        setSyncState('authNeeded');
+      } else if (/conflict/.test(e.message)) {
+        setSyncState('synced');
+      } else {
+        setSyncState('offline');
+        queuedForRetry = true;
+      }
+    } finally {
+      writeInFlight = false;
+      if (pendingWrite) {
+        pendingWrite = false;
+        scheduleDriveWrite();
+      }
+    }
+    if (thrownError) throw thrownError;
   }
 
   function reset() {
@@ -2413,8 +2451,21 @@ async function createDriveFile() {
     throw new Error('initial write failed: ' + writeResp.status + ' ' + err.slice(0, 200));
   }
 
-  console.log('[Drive] ✓ created file', fileId);
-  return { fileId, name: DRIVE_FILE_NAME };
+  // Immediately fetch the version of the newly-written file. Returning this
+  // lets the caller seed DriveBackend's version state directly, avoiding the
+  // race where Drive bumps the version between create and a separate pull.
+  const versionResp = await fetch(`${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?fields=version`, {
+    method: 'GET',
+    headers: { 'Authorization': 'Bearer ' + token }
+  });
+  let initialVersion = null;
+  if (versionResp.ok) {
+    const meta = await versionResp.json();
+    initialVersion = meta.version || null;
+  }
+
+  console.log('[Drive] ✓ created file', fileId, 'version=', initialVersion);
+  return { fileId, name: DRIVE_FILE_NAME, version: initialVersion };
 }
 
 // ─────────────────────────────────────────────
@@ -2715,14 +2766,13 @@ async function devsyncCreateFile() {
     devsyncStatus('Creating Drive file…');
     const result = await createDriveFile();
     setDriveFileId(result.fileId);
-    // Set display name if not set so writes have a meaningful "edited by"
     if (!getDisplayName()) setDisplayName('Test User');
-    // Activate DriveBackend with the new file
     DriveBackend.reset();
     setActiveBackend(DriveBackend);
-    // Pull initial empty content to populate cache + capture version
-    await DriveBackend.pullFromDrive();
-    devsyncStatus('✓ File created. ID: ' + result.fileId.slice(0, 12) + '…  DriveBackend active.', 'ok');
+    // Seed cache as empty + version directly from create. Avoids a stale
+    // pull where Drive's version may not yet reflect the just-completed write.
+    DriveBackend._debug.setVersion(result.version);
+    devsyncStatus('✓ File created. ID: ' + result.fileId.slice(0, 12) + '… version=' + result.version + '. DriveBackend active.', 'ok');
   } catch(e) {
     devsyncStatus('✗ Create failed: ' + e.message, 'fail');
   }
