@@ -388,8 +388,15 @@
   /* State: synced — green, steady */
   .sync-indicator.state-synced { color: var(--color-text-success); }
   .sync-indicator.state-synced .sync-indicator-dot { background: var(--color-text-success); }
-  /* State: offline — amber, no pulse, slightly stronger than localOnly */
-  .sync-indicator.state-offline { color: var(--color-text-info); }
+  /* State: offline — amber, no pulse, slightly stronger than localOnly.
+     Clickable: manual retry of failed sync. */
+  .sync-indicator.state-offline {
+    color: var(--color-text-info);
+    cursor: pointer;
+  }
+  .sync-indicator.state-offline:hover {
+    border-color: var(--color-text-info);
+  }
   .sync-indicator.state-offline .sync-indicator-dot { background: var(--color-text-info); }
   /* State: authNeeded — red, clickable, bordered to invite the click */
   .sync-indicator.state-authNeeded {
@@ -1611,6 +1618,28 @@
   <div id="undo-toast-bar" style="width:100%"></div>
 </div>
 
+<!-- ─── Phase 5 diagnostics panel ──────────────────────────────────────
+     Shown only when URL contains ?devsync=1. Used to test DriveBackend
+     in isolation before Phases 6/7 wire it through the wizard.
+     Removed in Phase 10 cleanup along with the keyboard sync-state cycler. -->
+<div id="devsync-panel" style="display:none;position:fixed;bottom:12px;right:12px;background:var(--color-background-secondary);border:1px solid var(--color-text-info);border-radius:6px;padding:12px 14px;font-family:var(--font-sans);font-size:11px;color:var(--color-text-primary);z-index:8000;max-width:340px;box-shadow:0 6px 24px rgba(0,0,0,0.5)">
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;border-bottom:1px solid var(--color-border-tertiary);padding-bottom:6px">
+    <span style="font-weight:700;color:var(--color-text-info);letter-spacing:0.05em">⚙ DEV SYNC PANEL</span>
+    <span style="font-size:9px;color:var(--color-text-tertiary);margin-left:auto">?devsync=1</span>
+  </div>
+  <div style="display:flex;flex-direction:column;gap:5px">
+    <button class="btn btn-sm" onclick="devsyncSignIn()">1. Sign in with Google</button>
+    <button class="btn btn-sm" onclick="devsyncCreateFile()">2. Create test file in Drive</button>
+    <button class="btn btn-sm" onclick="devsyncWriteTest()">3. Write test data</button>
+    <button class="btn btn-sm" onclick="devsyncReadFromDrive()">4. Read from Drive</button>
+    <button class="btn btn-sm" onclick="devsyncShowCache()">5. Show in-memory cache</button>
+    <button class="btn btn-sm btn-danger" onclick="devsyncForceConflict()">6. Force conflict (412 test)</button>
+    <button class="btn btn-sm" onclick="devsyncFlushNow()">⚡ Flush write now (skip debounce)</button>
+    <button class="btn btn-sm btn-danger" onclick="devsyncReset()">↺ Reset (clears file ID + cache)</button>
+  </div>
+  <div id="devsync-status" style="margin-top:8px;padding:6px 8px;background:var(--color-background-tertiary);border-radius:3px;font-size:10px;color:var(--color-text-secondary);min-height:32px;line-height:1.4">Ready. Click 1 first if not signed in, then 2, then 3-6 in any order.</div>
+</div>
+
 <!-- Google Identity Services — handles OAuth implicit flow. Loads async,
      populates window.google.accounts.oauth2 once ready. GoogleAuth.init()
      waits for it. -->
@@ -1707,10 +1736,23 @@ const LocalStorageBackend = {
   backendName() { return 'local'; }
 };
 
-// Public Storage interface. Currently routes everything to LocalStorageBackend.
-// In Session 2, this will route to a CloudBackend when configured, falling
-// back to LocalStorageBackend as an offline cache.
-const Storage = LocalStorageBackend;
+// Public Storage interface. Routes to whichever backend is currently active.
+// Defaults to LocalStorageBackend; switches to DriveBackend after the user
+// completes the wizard's Create or Pick path.
+//
+// Phase 5 introduces the runtime switch. The 'set' method is bound dynamically
+// so swapping ActiveBackend takes effect immediately for in-flight callers.
+let ActiveBackend = LocalStorageBackend;
+const Storage = {
+  get(key)        { return ActiveBackend.get(key); },
+  set(key, value) { return ActiveBackend.set(key, value); },
+  remove(key)     { return ActiveBackend.remove(key); },
+  backendName()   { return ActiveBackend.backendName(); }
+};
+function setActiveBackend(backend) {
+  ActiveBackend = backend;
+  console.log('[Storage] active backend →', backend.backendName());
+}
 
 // ─────────────────────────────────────────────
 // Sync state machine
@@ -1761,8 +1803,36 @@ function onSyncIndicatorClick() {
     return;
   }
   if (syncState === 'authNeeded') {
-    // Phase 5 will wire this to a re-auth popup
-    console.log('Re-auth click — Phase 5 will handle this');
+    // Re-auth: pop the Google sign-in flow
+    console.log('[sync] re-auth requested');
+    GoogleAuth.signIn();
+    // Once token comes back, attempt a pull to verify and flip back to synced
+    waitForToken(15000).then(ok => {
+      if (ok && getDriveFileId()) {
+        setSyncState('syncing');
+        DriveBackend.pullFromDrive()
+          .then(() => setSyncState('synced'))
+          .catch(e => {
+            console.warn('[sync] post-reauth pull failed:', e.message);
+            setSyncState('offline');
+          });
+      }
+    });
+    return;
+  }
+  if (syncState === 'offline') {
+    // Retry: try a flush, which will attempt to push queued changes
+    console.log('[sync] manual retry from offline');
+    if (DriveBackend._debug.isQueuedForRetry()) {
+      DriveBackend.flushNow();
+    } else {
+      // No queued write — try a pull to test connectivity
+      setSyncState('syncing');
+      DriveBackend.pullFromDrive()
+        .then(() => setSyncState('synced'))
+        .catch(() => setSyncState('offline'));
+    }
+    return;
   }
 }
 
@@ -1996,6 +2066,360 @@ const GoogleAuth = (function() {
 })();
 
 // ─────────────────────────────────────────────
+// DriveBackend — implements the Storage interface, routing reads/writes
+// to a single Google Drive file containing all family data as one nested
+// JSON blob.
+//
+// Why one file instead of five Drive files (one per storage key)?
+// Each Drive HTTP call is ~200-500ms. The five-key savePositions() in the
+// existing code would mean 5+ round-trips per save. Coalesce into one file:
+// one HTTP call per save burst, regardless of how many keys changed.
+//
+// Drive file shape:
+//   {
+//     "schemaVersion": 1,
+//     "lastEditedBy": "Tom",
+//     "lastEditedAt": "2026-05-05T12:34:56.789Z",
+//     "data": {
+//       "positions-v2":     { ... },
+//       "positions-closed": { ... },
+//       "sp-data":          { ... },
+//       "ledger":           { ... },
+//       "snapshots-v1":     { ... }
+//     }
+//   }
+//
+// Concurrency: ETag-based optimistic locking. We capture the ETag from
+// every successful read/write, send it as If-Match on writes. On 412
+// (Precondition Failed), surface a toast — user must reload.
+//
+// Offline: writes mirror to localStorage as a cache. On network fail,
+// reads come from the cache. Writes that fail enter a "queued" state and
+// retry on next save.
+//
+// Polygon API key intentionally stays in localStorage — it's per-device.
+// DriveBackend forwards 'polygon-api-key' to LocalStorageBackend.
+// ─────────────────────────────────────────────
+
+const DRIVE_FILE_ID_KEY = 'drive-file-id';
+const DRIVE_CACHE_KEY = 'drive-cache';
+const DRIVE_FILE_NAME = 'family-tracker-data.json';
+const DRIVE_FILE_DESCRIPTION = 'Family Portfolio Tracker — shared data file. Edit through the app, not directly.';
+const DRIVE_DEBOUNCE_MS = 1500;
+const DRIVE_API_BASE = 'https://www.googleapis.com/drive/v3';
+const DRIVE_UPLOAD_BASE = 'https://www.googleapis.com/upload/drive/v3';
+const LOCAL_ONLY_KEYS = new Set(['polygon-api-key']);
+
+function getDriveFileId() {
+  try { return localStorage.getItem('family-' + DRIVE_FILE_ID_KEY); }
+  catch(e) { return null; }
+}
+function setDriveFileId(id) {
+  try {
+    if (id) localStorage.setItem('family-' + DRIVE_FILE_ID_KEY, id);
+    else localStorage.removeItem('family-' + DRIVE_FILE_ID_KEY);
+  } catch(e) { console.warn('setDriveFileId failed', e); }
+}
+
+const DriveBackend = (function() {
+  let cache = null;
+  let etag = null;
+  let writeTimer = null;
+  let writeInFlight = false;
+  let pendingWrite = false;
+  let queuedForRetry = false;
+
+  function initFromCache() {
+    try {
+      const raw = localStorage.getItem('family-' + DRIVE_CACHE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.data) {
+          cache = parsed.data;
+          etag = parsed.etag || null;
+          console.log('[DriveBackend] loaded cache from localStorage');
+        }
+      }
+    } catch(e) {
+      console.warn('[DriveBackend] cache load failed', e.message);
+    }
+  }
+
+  function persistCache() {
+    try {
+      localStorage.setItem('family-' + DRIVE_CACHE_KEY, JSON.stringify({ etag, data: cache }));
+    } catch(e) {
+      console.warn('[DriveBackend] cache persist failed', e.message);
+    }
+  }
+
+  async function pullFromDrive() {
+    const fileId = getDriveFileId();
+    if (!fileId) throw new Error('no Drive file ID configured');
+    const token = GoogleAuth.getToken();
+    if (!token) throw new Error('not authenticated');
+
+    const url = `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?alt=media`;
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    if (resp.status === 401) { setSyncState('authNeeded'); throw new Error('401 unauthorized'); }
+    if (resp.status === 404) { throw new Error('Drive file not found (id may be stale or deleted)'); }
+    if (!resp.ok) { throw new Error('Drive read failed: ' + resp.status); }
+
+    const newEtag = resp.headers.get('ETag') || resp.headers.get('etag');
+    const text = await resp.text();
+    let parsed;
+    try { parsed = JSON.parse(text); }
+    catch(e) { throw new Error('Drive file content is not valid JSON: ' + e.message); }
+
+    cache = parsed.data || {};
+    etag = newEtag;
+    persistCache();
+
+    if (parsed.lastEditedBy && parsed.lastEditedAt) {
+      setLastEdited(parsed.lastEditedBy, parsed.lastEditedAt);
+    }
+    console.log('[DriveBackend] ✓ pulled from Drive, etag=', etag);
+    return parsed;
+  }
+
+  async function pushToDrive() {
+    const fileId = getDriveFileId();
+    if (!fileId) throw new Error('no Drive file ID configured');
+    const token = GoogleAuth.getToken();
+    if (!token) throw new Error('not authenticated');
+
+    const body = JSON.stringify({
+      schemaVersion: 1,
+      lastEditedBy: getDisplayName() || 'Unknown',
+      lastEditedAt: new Date().toISOString(),
+      data: cache || {}
+    });
+
+    const url = `${DRIVE_UPLOAD_BASE}/files/${encodeURIComponent(fileId)}?uploadType=media`;
+    const headers = {
+      'Authorization': 'Bearer ' + token,
+      'Content-Type': 'application/json'
+    };
+    if (etag) headers['If-Match'] = etag;
+
+    const resp = await fetch(url, { method: 'PATCH', headers, body });
+
+    if (resp.status === 401) { setSyncState('authNeeded'); throw new Error('401 unauthorized'); }
+    if (resp.status === 412) {
+      showConflictToast();
+      throw new Error('412 conflict — remote was edited');
+    }
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => '');
+      throw new Error('Drive write failed: ' + resp.status + ' ' + errText.slice(0, 200));
+    }
+
+    const newEtag = resp.headers.get('ETag') || resp.headers.get('etag');
+    etag = newEtag;
+    persistCache();
+    setLastEdited(getDisplayName() || 'You', new Date().toISOString());
+    console.log('[DriveBackend] ✓ pushed to Drive, new etag=', etag);
+  }
+
+  async function get(key) {
+    if (LOCAL_ONLY_KEYS.has(key)) return LocalStorageBackend.get(key);
+    if (cache === null) {
+      initFromCache();
+      if (cache === null) return null;
+    }
+    const value = cache[key];
+    if (value === undefined || value === null) return null;
+    return JSON.stringify(value);
+  }
+
+  async function set(key, value) {
+    if (LOCAL_ONLY_KEYS.has(key)) return LocalStorageBackend.set(key, value);
+    if (cache === null) cache = {};
+    let parsedValue;
+    try { parsedValue = JSON.parse(value); }
+    catch(e) { console.warn('[DriveBackend] set() got non-JSON value for', key); parsedValue = value; }
+    cache[key] = parsedValue;
+    persistCache();
+    scheduleDriveWrite();
+    return true;
+  }
+
+  async function remove(key) {
+    if (LOCAL_ONLY_KEYS.has(key)) return LocalStorageBackend.remove(key);
+    if (cache === null) cache = {};
+    delete cache[key];
+    persistCache();
+    scheduleDriveWrite();
+    return true;
+  }
+
+  function backendName() { return 'drive'; }
+
+  function scheduleDriveWrite() {
+    clearTimeout(writeTimer);
+    writeTimer = setTimeout(executeWrite, DRIVE_DEBOUNCE_MS);
+  }
+
+  async function executeWrite() {
+    if (writeInFlight) {
+      pendingWrite = true;
+      return;
+    }
+    writeInFlight = true;
+    setSyncState('syncing');
+    try {
+      await pushToDrive();
+      setSyncState('synced');
+      queuedForRetry = false;
+    } catch(e) {
+      console.warn('[DriveBackend] write error:', e.message);
+      if (/401/.test(e.message)) {
+        setSyncState('authNeeded');
+      } else if (/412/.test(e.message)) {
+        setSyncState('synced');
+      } else {
+        setSyncState('offline');
+        queuedForRetry = true;
+      }
+    } finally {
+      writeInFlight = false;
+      if (pendingWrite) {
+        pendingWrite = false;
+        scheduleDriveWrite();
+      }
+    }
+  }
+
+  function flushNow() {
+    clearTimeout(writeTimer);
+    return executeWrite();
+  }
+
+  function reset() {
+    cache = null;
+    etag = null;
+    clearTimeout(writeTimer);
+    writeInFlight = false;
+    pendingWrite = false;
+    queuedForRetry = false;
+    try { localStorage.removeItem('family-' + DRIVE_CACHE_KEY); } catch(e) {}
+  }
+
+  return {
+    get, set, remove, backendName,
+    pullFromDrive, pushToDrive, flushNow, reset, initFromCache,
+    _debug: {
+      getCache: () => cache,
+      getEtag: () => etag,
+      setEtag: (v) => { etag = v; },
+      isWriteInFlight: () => writeInFlight,
+      isQueuedForRetry: () => queuedForRetry
+    }
+  };
+})();
+
+// ─────────────────────────────────────────────
+// Drive file creation — preview of Phase 6 logic, exposed to the diagnostics
+// panel so Phase 5 can be tested in isolation. Phase 6 will wire this into
+// the wizard's Create path button.
+// ─────────────────────────────────────────────
+async function createDriveFile() {
+  const token = GoogleAuth.getToken();
+  if (!token) throw new Error('not authenticated; sign in first');
+
+  const metadata = {
+    name: DRIVE_FILE_NAME,
+    description: DRIVE_FILE_DESCRIPTION,
+    mimeType: 'application/json'
+  };
+  const createResp = await fetch(`${DRIVE_API_BASE}/files`, {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + token,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(metadata)
+  });
+  if (!createResp.ok) {
+    const err = await createResp.text().catch(() => '');
+    throw new Error('file create failed: ' + createResp.status + ' ' + err.slice(0, 200));
+  }
+  const created = await createResp.json();
+  const fileId = created.id;
+
+  const initialBody = JSON.stringify({
+    schemaVersion: 1,
+    lastEditedBy: getDisplayName() || 'Unknown',
+    lastEditedAt: new Date().toISOString(),
+    data: {}
+  });
+  const writeResp = await fetch(`${DRIVE_UPLOAD_BASE}/files/${encodeURIComponent(fileId)}?uploadType=media`, {
+    method: 'PATCH',
+    headers: {
+      'Authorization': 'Bearer ' + token,
+      'Content-Type': 'application/json'
+    },
+    body: initialBody
+  });
+  if (!writeResp.ok) {
+    const err = await writeResp.text().catch(() => '');
+    throw new Error('initial write failed: ' + writeResp.status + ' ' + err.slice(0, 200));
+  }
+  const initialEtag = writeResp.headers.get('ETag') || writeResp.headers.get('etag');
+
+  console.log('[Drive] ✓ created file', fileId, 'etag=', initialEtag);
+  return { fileId, etag: initialEtag, name: DRIVE_FILE_NAME };
+}
+
+// ─────────────────────────────────────────────
+// Conflict toast — shown when a 412 fires on Drive write.
+// User has to reload to pick up the remote changes; we don't auto-merge.
+// ─────────────────────────────────────────────
+function showConflictToast() {
+  let toast = document.getElementById('conflict-toast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'conflict-toast';
+    toast.style.cssText = `
+      position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+      background: var(--color-background-danger); color: var(--color-text-danger);
+      border: 1px solid var(--color-text-danger); border-radius: var(--border-radius-md);
+      padding: 12px 18px; font-size: 11px; font-family: var(--font-sans);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4); z-index: 9999;
+      max-width: 480px; line-height: 1.5;
+    `;
+    document.body.appendChild(toast);
+  }
+  toast.innerHTML = `
+    <strong>Someone else edited this.</strong><br>
+    Reload to see their changes, then redo yours.
+    <button onclick="location.reload()" style="margin-left:8px;font-family:var(--font-sans);font-size:10px;background:var(--color-text-danger);color:#000;border:none;padding:3px 10px;border-radius:3px;cursor:pointer">Reload</button>
+    <button onclick="document.getElementById('conflict-toast').remove()" style="margin-left:4px;font-family:var(--font-sans);font-size:10px;background:transparent;color:var(--color-text-danger);border:1px solid var(--color-text-danger);padding:3px 10px;border-radius:3px;cursor:pointer">Dismiss</button>
+  `;
+  toast.style.display = 'block';
+}
+
+// ─────────────────────────────────────────────
+// Online/offline detection — DriveBackend retries queued writes on reconnect.
+// ─────────────────────────────────────────────
+window.addEventListener('online', () => {
+  console.log('[network] back online');
+  if (DriveBackend._debug.isQueuedForRetry()) {
+    console.log('[DriveBackend] retrying queued write');
+    DriveBackend.flushNow();
+  }
+});
+window.addEventListener('offline', () => {
+  console.log('[network] gone offline');
+  if (ActiveBackend.backendName() === 'drive') {
+    setSyncState('offline');
+  }
+});
+
+// ─────────────────────────────────────────────
 // Setup wizard
 //
 // Three paths a user can take on first run:
@@ -2214,6 +2638,171 @@ function waitForToken(timeoutMs) {
     document.addEventListener('DOMContentLoaded', ensureReady);
   } else {
     ensureReady();
+  }
+})();
+
+// ─────────────────────────────────────────────
+// Phase 5 diagnostics — handlers for the devsync panel.
+// Panel itself is shown only when ?devsync=1 is in the URL.
+// Removed in Phase 10 cleanup.
+// ─────────────────────────────────────────────
+function devsyncStatus(msg, kind) {
+  const el = document.getElementById('devsync-status');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = kind === 'ok'   ? 'var(--color-text-success)'
+                 : kind === 'fail' ? 'var(--color-text-danger)'
+                 : 'var(--color-text-secondary)';
+}
+
+async function devsyncSignIn() {
+  if (GoogleAuth.isSignedIn()) {
+    devsyncStatus('Already signed in. Token valid.', 'ok');
+    return;
+  }
+  devsyncStatus('Opening Google sign-in popup…');
+  GoogleAuth.signIn();
+  const ok = await waitForToken(15000);
+  if (ok) devsyncStatus('✓ Signed in.', 'ok');
+  else    devsyncStatus('✗ Sign-in failed or cancelled.', 'fail');
+}
+
+async function devsyncCreateFile() {
+  try {
+    devsyncStatus('Creating Drive file…');
+    const result = await createDriveFile();
+    setDriveFileId(result.fileId);
+    // Set display name if not set so writes have a meaningful "edited by"
+    if (!getDisplayName()) setDisplayName('Test User');
+    // Activate DriveBackend with the new file
+    DriveBackend.reset();
+    setActiveBackend(DriveBackend);
+    // Pull initial empty content to populate cache + capture etag
+    await DriveBackend.pullFromDrive();
+    devsyncStatus('✓ File created. ID: ' + result.fileId.slice(0, 12) + '…  DriveBackend active.', 'ok');
+  } catch(e) {
+    devsyncStatus('✗ Create failed: ' + e.message, 'fail');
+  }
+}
+
+async function devsyncWriteTest() {
+  if (!getDriveFileId()) {
+    devsyncStatus('✗ No Drive file ID. Run step 2 first.', 'fail');
+    return;
+  }
+  if (ActiveBackend.backendName() !== 'drive') {
+    devsyncStatus('✗ DriveBackend not active. Run step 2 first.', 'fail');
+    return;
+  }
+  try {
+    devsyncStatus('Writing test data…');
+    const testKey = 'positions-v2';
+    const testValue = JSON.stringify({
+      positions: [{ id: 999, ticker: 'TEST', shares: 10, pricePaid: 100, _testWrite: new Date().toISOString() }],
+      nextId: 1000,
+      _testMarker: 'phase5-write-test-' + Date.now()
+    });
+    await DriveBackend.set(testKey, testValue);
+    devsyncStatus('Wrote to cache. Forcing immediate flush (bypassing debounce)…');
+    await DriveBackend.flushNow();
+    devsyncStatus('✓ Written. Check sync indicator → should be "Synced".', 'ok');
+  } catch(e) {
+    devsyncStatus('✗ Write failed: ' + e.message, 'fail');
+  }
+}
+
+async function devsyncReadFromDrive() {
+  if (!getDriveFileId()) {
+    devsyncStatus('✗ No Drive file ID. Run step 2 first.', 'fail');
+    return;
+  }
+  try {
+    devsyncStatus('Reading from Drive…');
+    const result = await DriveBackend.pullFromDrive();
+    const summary = {
+      schemaVersion: result.schemaVersion,
+      lastEditedBy: result.lastEditedBy,
+      lastEditedAt: result.lastEditedAt,
+      keys: Object.keys(result.data || {})
+    };
+    console.log('[devsync] Drive content:', result);
+    devsyncStatus('✓ Read OK. Keys: ' + summary.keys.join(', ') + '. lastEditedBy: ' + summary.lastEditedBy, 'ok');
+  } catch(e) {
+    devsyncStatus('✗ Read failed: ' + e.message, 'fail');
+  }
+}
+
+function devsyncShowCache() {
+  const cache = DriveBackend._debug.getCache();
+  const etag = DriveBackend._debug.getEtag();
+  console.log('[devsync] in-memory cache:', cache);
+  console.log('[devsync] etag:', etag);
+  if (cache === null) {
+    devsyncStatus('Cache is null (no read happened yet).', 'info');
+  } else {
+    devsyncStatus('Cache logged to console. Keys: ' + Object.keys(cache).join(', ') + '. etag: ' + (etag || 'none'), 'ok');
+  }
+}
+
+async function devsyncForceConflict() {
+  if (!getDriveFileId()) {
+    devsyncStatus('✗ No Drive file ID. Run step 2 first.', 'fail');
+    return;
+  }
+  if (ActiveBackend.backendName() !== 'drive') {
+    devsyncStatus('✗ DriveBackend not active.', 'fail');
+    return;
+  }
+  try {
+    devsyncStatus('Forcing 412 by stale ETag…');
+    // Manually set the etag to a known-bad value, then attempt write
+    DriveBackend._debug.setEtag('"this-is-an-intentionally-wrong-etag"');
+    await DriveBackend.set('positions-v2', JSON.stringify({ _conflictTest: Date.now() }));
+    await DriveBackend.flushNow();
+    devsyncStatus('Hmm — write succeeded; expected 412. Drive may not be enforcing If-Match.', 'fail');
+  } catch(e) {
+    if (/412/.test(e.message)) {
+      devsyncStatus('✓ Conflict detected as expected. Toast should be visible.', 'ok');
+    } else {
+      devsyncStatus('✗ Got a different error: ' + e.message, 'fail');
+    }
+  }
+}
+
+async function devsyncFlushNow() {
+  try {
+    devsyncStatus('Flushing pending write…');
+    await DriveBackend.flushNow();
+    devsyncStatus('✓ Flush complete.', 'ok');
+  } catch(e) {
+    devsyncStatus('✗ Flush failed: ' + e.message, 'fail');
+  }
+}
+
+function devsyncReset() {
+  if (!confirm('Reset will: clear Drive file ID, clear in-memory cache, switch back to LocalStorageBackend. Your actual Drive file will NOT be deleted (delete it manually from drive.google.com if you want). Continue?')) return;
+  setDriveFileId(null);
+  DriveBackend.reset();
+  setActiveBackend(LocalStorageBackend);
+  setSyncState('localOnly');
+  devsyncStatus('Reset done. Back to LocalStorageBackend.', 'ok');
+}
+
+// Show the devsync panel if URL has ?devsync=1.
+(function setupDevsyncPanel() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('devsync') !== '1') return;
+  const showWhenReady = () => {
+    const panel = document.getElementById('devsync-panel');
+    if (panel) {
+      panel.style.display = '';
+      console.log('[dev] sync diagnostics panel enabled (?devsync=1)');
+    }
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', showWhenReady);
+  } else {
+    showWhenReady();
   }
 })();
 
@@ -8250,6 +8839,33 @@ function clearAll() {
 // Theme and sleeve are tagged manually by the user; this is intentional.
 // ─────────────────────────────────────────────
 async function init() {
+  // Phase 5: if user has finished cloud setup, switch to DriveBackend and
+  // pull fresh data before loadPositions() runs. If we're offline or auth
+  // fails, the cache populated by initFromCache() carries us through.
+  const status = getSetupStatus();
+  if (status === 'cloud-configured' && getDriveFileId()) {
+    DriveBackend.initFromCache();   // populate from localStorage mirror first
+    setActiveBackend(DriveBackend);
+    setSyncState('syncing');
+    try {
+      await GoogleAuth.init();
+      // Try to acquire a token silently. If it fails, user clicks the
+      // authNeeded indicator to re-auth.
+      if (!GoogleAuth.isSignedIn()) {
+        // We can't pop a popup at boot (browser blocks), so flip to authNeeded
+        // and rely on cached data until user re-authenticates.
+        setSyncState('authNeeded');
+      } else {
+        await DriveBackend.pullFromDrive();
+        setSyncState('synced');
+      }
+    } catch(e) {
+      console.warn('[init] Drive boot failed, using cache:', e.message);
+      // Cache populated by initFromCache() gives us local fallback
+      setSyncState('offline');
+    }
+  }
+
   await loadPositions();
   await loadPolygonKey();
   restoreSpxInput();
