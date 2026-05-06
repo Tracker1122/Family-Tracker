@@ -348,6 +348,61 @@
   }
   .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
 
+  /* ── Sync indicator ── */
+  /* Lives in the header. Five states, color-coded. The dot is the main
+     visual; the label sits next to it. authNeeded is the only clickable
+     state — it opens the re-auth flow. */
+  .sync-indicator {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 10px; color: var(--color-text-tertiary);
+    padding: 3px 8px; border-radius: var(--border-radius-md);
+    border: 1px solid transparent;
+    user-select: none;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
+  }
+  .sync-indicator-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--color-text-tertiary);
+    flex-shrink: 0;
+  }
+  /* State: localOnly — gray, muted, default boot state */
+  .sync-indicator.state-localOnly { color: var(--color-text-tertiary); }
+  .sync-indicator.state-localOnly .sync-indicator-dot { background: var(--color-text-tertiary); }
+  /* State: syncing — amber, pulsing */
+  .sync-indicator.state-syncing { color: var(--color-text-info); }
+  .sync-indicator.state-syncing .sync-indicator-dot {
+    background: var(--color-text-info);
+    animation: sync-pulse 1.2s ease-in-out infinite;
+  }
+  /* State: synced — green, steady */
+  .sync-indicator.state-synced { color: var(--color-text-success); }
+  .sync-indicator.state-synced .sync-indicator-dot { background: var(--color-text-success); }
+  /* State: offline — amber, no pulse, slightly stronger than localOnly */
+  .sync-indicator.state-offline { color: var(--color-text-info); }
+  .sync-indicator.state-offline .sync-indicator-dot { background: var(--color-text-info); }
+  /* State: authNeeded — red, clickable, bordered to invite the click */
+  .sync-indicator.state-authNeeded {
+    color: var(--color-text-danger);
+    border-color: var(--color-text-danger);
+    background: var(--color-background-danger);
+    cursor: pointer;
+  }
+  .sync-indicator.state-authNeeded:hover { background: rgba(248, 113, 113, 0.16); }
+  .sync-indicator.state-authNeeded .sync-indicator-dot { background: var(--color-text-danger); }
+
+  @keyframes sync-pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.35; }
+  }
+
+  /* Last-edited indicator — sits next to sync indicator. Hidden in localOnly. */
+  .last-edited {
+    font-size: 10px;
+    color: var(--color-text-tertiary);
+    white-space: nowrap;
+  }
+  .last-edited.hidden { display: none; }
+
   /* ── Table actions ── */
   .table-actions {
     display: flex; gap: 8px; align-items: center; margin-bottom: 20px;
@@ -629,6 +684,13 @@
 <div class="header">
   <div class="header-title">Family Portfolio Tracker</div>
   <div class="header-actions">
+    <!-- Sync indicator — Phase 2 visible scaffolding. Click handler only fires
+         in authNeeded state; later phases will swap in real handlers. -->
+    <div id="sync-indicator" class="sync-indicator state-localOnly" onclick="onSyncIndicatorClick()" title="Cloud sync status">
+      <span class="sync-indicator-dot"></span>
+      <span id="sync-indicator-label">Local only</span>
+    </div>
+    <span id="last-edited" class="last-edited hidden"></span>
     <span id="save-note-inline" style="font-size:10px;color:var(--color-text-tertiary);opacity:0;transition:opacity 0.3s;">Saved</span>
     <button class="btn btn-sm" onclick="addPosition()">+ Add Position</button>
     <button class="btn btn-sm" onclick="exportData()" style="margin-right:4px">⬇ Export Data</button>
@@ -1457,6 +1519,106 @@ const LocalStorageBackend = {
 // In Session 2, this will route to a CloudBackend when configured, falling
 // back to LocalStorageBackend as an offline cache.
 const Storage = LocalStorageBackend;
+
+// ─────────────────────────────────────────────
+// Sync state machine
+//
+// Five states, only one active at a time:
+//   localOnly   — no Drive configured, default boot state (current behavior)
+//   syncing     — write in flight to Drive
+//   synced      — last write succeeded, all good
+//   offline     — Drive unreachable, falling back to local cache
+//   authNeeded  — token expired, user must re-auth
+//
+// Phase 2: state machine + visible indicator only. No Drive code yet.
+// Phase 3+ wires real transitions from OAuth and DriveBackend.
+//
+// The dev-only keyboard shortcut (Ctrl+Shift+S) cycles through states so
+// each visual treatment can be eyeballed without faking network calls.
+// Removed in Phase 10 cleanup.
+// ─────────────────────────────────────────────
+const SYNC_STATES = ['localOnly', 'syncing', 'synced', 'offline', 'authNeeded'];
+const SYNC_STATE_LABELS = {
+  localOnly:  'Local only',
+  syncing:    'Syncing…',
+  synced:     'Synced',
+  offline:    'Offline',
+  authNeeded: 'Sign in'
+};
+let syncState = 'localOnly';
+
+function setSyncState(newState) {
+  if (!SYNC_STATES.includes(newState)) {
+    console.warn('setSyncState: unknown state', newState);
+    return;
+  }
+  syncState = newState;
+  const el = document.getElementById('sync-indicator');
+  const label = document.getElementById('sync-indicator-label');
+  if (!el || !label) return;
+  // Remove all state-* classes, add the current one
+  SYNC_STATES.forEach(s => el.classList.remove('state-' + s));
+  el.classList.add('state-' + newState);
+  label.textContent = SYNC_STATE_LABELS[newState];
+}
+
+function onSyncIndicatorClick() {
+  // Only authNeeded is clickable in current phase; others no-op.
+  // Phase 3 will wire this to the re-auth popup.
+  if (syncState === 'authNeeded') {
+    console.log('Re-auth click — Phase 3 will handle this');
+  }
+}
+
+// Last-edited indicator — Phase 2 placeholder. Phase 9 fills this from
+// remote data. Hidden in localOnly state.
+function setLastEdited(name, isoTimestamp) {
+  const el = document.getElementById('last-edited');
+  if (!el) return;
+  if (!name || !isoTimestamp || syncState === 'localOnly') {
+    el.classList.add('hidden');
+    el.textContent = '';
+    return;
+  }
+  // Format: "edited by Tom · 2m ago" — keep it short, header is crowded
+  const ago = formatRelativeTime(isoTimestamp);
+  el.textContent = `edited by ${name} · ${ago}`;
+  el.classList.remove('hidden');
+}
+
+function formatRelativeTime(isoTimestamp) {
+  const then = new Date(isoTimestamp).getTime();
+  if (isNaN(then)) return '?';
+  const diffMs = Date.now() - then;
+  const diffSec = Math.round(diffMs / 1000);
+  if (diffSec < 60)    return 'just now';
+  const diffMin = Math.round(diffSec / 60);
+  if (diffMin < 60)    return diffMin + 'm ago';
+  const diffHr  = Math.round(diffMin / 60);
+  if (diffHr  < 24)    return diffHr + 'h ago';
+  const diffDay = Math.round(diffHr / 24);
+  if (diffDay < 7)     return diffDay + 'd ago';
+  // Older than a week — show a date
+  return new Date(isoTimestamp).toLocaleDateString();
+}
+
+// Dev-only: Ctrl+Shift+S cycles through sync states for visual testing.
+// Removed in Phase 10.
+document.addEventListener('keydown', (e) => {
+  if (e.ctrlKey && e.shiftKey && e.key === 'S') {
+    e.preventDefault();
+    const idx = SYNC_STATES.indexOf(syncState);
+    const next = SYNC_STATES[(idx + 1) % SYNC_STATES.length];
+    setSyncState(next);
+    // Demo last-edited: show in non-localOnly states
+    if (next !== 'localOnly') {
+      setLastEdited('Tom', new Date(Date.now() - 3 * 60000).toISOString());
+    } else {
+      setLastEdited(null, null);
+    }
+    console.log('[dev] sync state →', next);
+  }
+});
 
 // Convenience wrappers for JSON values — most app data is JSON.
 async function storageGetJSON(key) {
