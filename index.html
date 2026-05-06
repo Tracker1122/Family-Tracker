@@ -2215,21 +2215,34 @@ const DriveBackend = (function() {
     return parsed;
   }
 
-  async function pushToDrive() {
+  // When `_skipConflictRetry` is true, pushToDrive treats version mismatches
+  // as terminal conflicts. Used by diagnostics to test the conflict path.
+  // In normal operation, Drive's async version bumps cause spurious mismatches,
+  // so we retry once on mismatch (refetch version, push again).
+  let _skipConflictRetry = false;
+
+  async function pushToDrive(_isRetry) {
     const fileId = getDriveFileId();
     if (!fileId) throw new Error('no Drive file ID configured');
     const token = GoogleAuth.getToken();
     if (!token) throw new Error('not authenticated');
 
     // Version-based optimistic concurrency: check current version before writing.
-    // If the remote version doesn't match what we last saw, someone else edited
-    // the file. Abort with conflict toast.
+    // If mismatch and not yet retried and not in skip-retry mode, refetch + retry.
     if (version !== null) {
       const currentVersion = await fetchDriveVersion();
       if (currentVersion !== version) {
         console.warn('[DriveBackend] version mismatch: ours=', version, 'remote=', currentVersion);
-        showConflictToast();
-        throw new Error('412 conflict — remote version changed (was ' + version + ', now ' + currentVersion + ')');
+        if (_isRetry || _skipConflictRetry) {
+          // Already retried, or diagnostics asked us not to retry.
+          showConflictToast();
+          throw new Error('412 conflict — remote version changed (was ' + version + ', now ' + currentVersion + ')');
+        }
+        // Auto-retry: adopt the new version (assumes Drive's internal bump,
+        // not a concurrent user edit). Push our cache against the new version.
+        console.log('[DriveBackend] auto-retry with new version', currentVersion);
+        version = currentVersion;
+        return pushToDrive(true);
       }
     }
 
@@ -2259,7 +2272,7 @@ const DriveBackend = (function() {
       version = await fetchDriveVersion();
     } catch(e) {
       console.warn('[DriveBackend] post-write version fetch failed:', e.message);
-      version = null;  // force fresh pull next time
+      version = null;
     }
     persistCache();
     setLastEdited(getDisplayName() || 'You', new Date().toISOString());
@@ -2398,7 +2411,8 @@ const DriveBackend = (function() {
       getVersion: () => version,
       setVersion: (v) => { version = v; },
       isWriteInFlight: () => writeInFlight,
-      isQueuedForRetry: () => queuedForRetry
+      isQueuedForRetry: () => queuedForRetry,
+      setSkipConflictRetry: (v) => { _skipConflictRetry = v; }
     }
   };
 })();
@@ -2847,9 +2861,9 @@ async function devsyncForceConflict() {
     return;
   }
   try {
-    devsyncStatus('Forcing conflict by stale version…');
-    // Plant a known-bad version. pushToDrive will fetch the real current
-    // version, see they don't match, and abort with a conflict.
+    devsyncStatus('Forcing conflict by stale version (retry disabled for test)…');
+    // Disable auto-retry so the bad version actually triggers a conflict.
+    DriveBackend._debug.setSkipConflictRetry(true);
     DriveBackend._debug.setVersion('999999999');
     await DriveBackend.set('positions-v2', JSON.stringify({ _conflictTest: Date.now() }));
     await DriveBackend.flushNow();
@@ -2860,6 +2874,9 @@ async function devsyncForceConflict() {
     } else {
       devsyncStatus('✗ Got a different error: ' + e.message, 'fail');
     }
+  } finally {
+    // Re-enable retry for normal operation
+    DriveBackend._debug.setSkipConflictRetry(false);
   }
 }
 
