@@ -365,8 +365,16 @@
     background: var(--color-text-tertiary);
     flex-shrink: 0;
   }
-  /* State: localOnly — gray, muted, default boot state */
-  .sync-indicator.state-localOnly { color: var(--color-text-tertiary); }
+  /* State: localOnly — gray, muted, default boot state.
+     Clickable: opens setup wizard so user can enable cloud sync. */
+  .sync-indicator.state-localOnly {
+    color: var(--color-text-tertiary);
+    cursor: pointer;
+  }
+  .sync-indicator.state-localOnly:hover {
+    color: var(--color-text-secondary);
+    border-color: var(--color-border-secondary);
+  }
   .sync-indicator.state-localOnly .sync-indicator-dot { background: var(--color-text-tertiary); }
   /* State: syncing — amber, pulsing */
   .sync-indicator.state-syncing { color: var(--color-text-info); }
@@ -402,6 +410,66 @@
     white-space: nowrap;
   }
   .last-edited.hidden { display: none; }
+
+  /* ── Setup wizard ── */
+  /* Path picker buttons (Screen 1) */
+  .wizard-paths {
+    display: flex; flex-direction: column; gap: 8px;
+    margin: 16px 0 4px;
+  }
+  .wizard-path-btn {
+    display: flex; align-items: flex-start; gap: 12px;
+    padding: 14px 16px;
+    background: var(--color-background-tertiary);
+    border: 1px solid var(--color-border-secondary);
+    border-radius: var(--border-radius-md);
+    color: var(--color-text-primary);
+    font-family: var(--font-sans);
+    text-align: left; cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .wizard-path-btn:hover {
+    border-color: var(--color-text-info);
+    background: var(--color-background-info);
+  }
+  .wizard-path-icon {
+    font-size: 18px; line-height: 1;
+    flex-shrink: 0; padding-top: 2px;
+  }
+  .wizard-path-title {
+    font-size: 12px; font-weight: 700;
+    color: var(--color-text-primary); margin-bottom: 2px;
+  }
+  .wizard-path-desc {
+    font-size: 10px; color: var(--color-text-tertiary);
+    line-height: 1.5;
+  }
+  /* Info blocks (Screens 3a/3b/3c) */
+  .wizard-info-block {
+    background: var(--color-background-tertiary);
+    border: 1px solid var(--color-border-tertiary);
+    border-radius: var(--border-radius-md);
+    padding: 12px 14px;
+    margin: 12px 0 4px;
+  }
+  .wizard-info-block.wizard-info-warn {
+    border-color: var(--color-text-info);
+    background: var(--color-background-info);
+  }
+  .wizard-info-title {
+    font-size: 9px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.1em; color: var(--color-text-tertiary);
+    margin-bottom: 6px;
+  }
+  .wizard-info-body {
+    font-size: 11px; color: var(--color-text-secondary);
+    line-height: 1.55;
+  }
+  .wizard-info-body code {
+    background: var(--color-background-secondary);
+    padding: 1px 4px; border-radius: 3px;
+    font-size: 10px; color: var(--color-text-info);
+  }
 
   /* ── Table actions ── */
   .table-actions {
@@ -691,11 +759,6 @@
       <span id="sync-indicator-label">Local only</span>
     </div>
     <span id="last-edited" class="last-edited hidden"></span>
-    <!-- Phase 3 dev-mode test buttons. Hidden by default. Shown only when
-         URL contains ?devauth=1. Removed in Phase 4 once real wizard exists. -->
-    <button id="devauth-signin" class="btn btn-sm" onclick="GoogleAuth.signIn()" style="display:none">🧪 Sign in (test)</button>
-    <button id="devauth-signout" class="btn btn-sm" onclick="GoogleAuth.signOut()" style="display:none">🧪 Sign out (test)</button>
-    <span id="devauth-status" style="display:none;font-size:10px;color:var(--color-text-tertiary)"></span>
     <span id="save-note-inline" style="font-size:10px;color:var(--color-text-tertiary);opacity:0;transition:opacity 0.3s;">Saved</span>
     <button class="btn btn-sm" onclick="addPosition()">+ Add Position</button>
     <button class="btn btn-sm" onclick="exportData()" style="margin-right:4px">⬇ Export Data</button>
@@ -1414,6 +1477,122 @@
   </div>
 </div>
 
+<!-- Setup wizard — appears on every load until cloud sync is configured
+     OR user explicitly chose local-only. Three paths: create / pick / local. -->
+<div class="modal-overlay hidden" id="setup-wizard-modal">
+  <div class="modal" style="max-width:520px">
+    <!-- ─── Screen 1: path picker ─── -->
+    <div id="wizard-screen-1">
+      <div class="modal-title">Welcome to Family Portfolio Tracker</div>
+      <div class="modal-subtitle">How do you want to use this tracker? You can change this later.</div>
+      <div class="wizard-paths">
+        <button class="wizard-path-btn" onclick="wizardChoosePath('create')">
+          <div class="wizard-path-icon">☁</div>
+          <div>
+            <div class="wizard-path-title">Create a new family tracker</div>
+            <div class="wizard-path-desc">Sign in with Google. Saves to your Drive. Pick this on the first device.</div>
+          </div>
+        </button>
+        <button class="wizard-path-btn" onclick="wizardChoosePath('pick')">
+          <div class="wizard-path-icon">📂</div>
+          <div>
+            <div class="wizard-path-title">Open an existing family tracker</div>
+            <div class="wizard-path-desc">If someone in your family already created one, pick it from Google Drive. Look in <em>Shared with me</em>.</div>
+          </div>
+        </button>
+        <button class="wizard-path-btn" onclick="wizardChoosePath('local')">
+          <div class="wizard-path-icon">💻</div>
+          <div>
+            <div class="wizard-path-title">Use without cloud sync</div>
+            <div class="wizard-path-desc">Just this device. No Google account. Data stays in your browser only.</div>
+          </div>
+        </button>
+      </div>
+    </div>
+
+    <!-- ─── Screen 2: display name (only for create / pick paths) ─── -->
+    <div id="wizard-screen-2" class="hidden">
+      <div class="modal-title">What name should we show?</div>
+      <div class="modal-subtitle">Used so the other person knows when you've made changes. Just a first name is fine.</div>
+      <div class="modal-field">
+        <label class="modal-label">Display name</label>
+        <input type="text" id="wizard-displayname-input" class="modal-input" maxlength="20" placeholder="e.g. Tom" autocomplete="off">
+        <div style="font-size:10px;color:var(--color-text-tertiary);margin-top:4px">Stored on this device. Won't be shared anywhere except in "last edited by" notes.</div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" onclick="wizardBack()">← Back</button>
+        <button id="wizard-name-continue" class="btn btn-primary" onclick="wizardConfirmName()" disabled>Continue</button>
+      </div>
+    </div>
+
+    <!-- ─── Screen 3a: create-path instructions ─── -->
+    <div id="wizard-screen-3-create" class="hidden">
+      <div class="modal-title">Sign in with Google</div>
+      <div class="modal-subtitle">We'll create a new file in your Google Drive to hold the family tracker data.</div>
+      <div class="wizard-info-block">
+        <div class="wizard-info-title">After signing in</div>
+        <div class="wizard-info-body">
+          We'll create the file. Then you'll need to share it with your family from Google Drive (right-click the file → Share → add their email as Editor). The app can't share files for you — that's a Google security thing. We'll show you the file name once it's created.
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" onclick="wizardBack()">← Back</button>
+        <button class="btn btn-primary" onclick="wizardCreateFile()">Sign in &amp; create file</button>
+      </div>
+    </div>
+
+    <!-- ─── Screen 3b: pick-path instructions ─── -->
+    <div id="wizard-screen-3-pick" class="hidden">
+      <div class="modal-title">Open an existing family tracker</div>
+      <div class="modal-subtitle">Sign in with Google, then pick the family tracker file someone else created.</div>
+      <div class="wizard-info-block">
+        <div class="wizard-info-title">Where to find it</div>
+        <div class="wizard-info-body">
+          The other person needs to have shared the file with you first. Look under <strong>Shared with me</strong> in the Google Picker that opens. The filename will end with <code>family-tracker-data.json</code>.
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" onclick="wizardBack()">← Back</button>
+        <button class="btn btn-primary" onclick="wizardPickFile()">Sign in &amp; pick file</button>
+      </div>
+    </div>
+
+    <!-- ─── Screen 3c: local-only confirmation ─── -->
+    <div id="wizard-screen-3-local" class="hidden">
+      <div class="modal-title">Use without cloud sync — are you sure?</div>
+      <div class="modal-subtitle">Picking this means data only lives on this device.</div>
+      <div class="wizard-info-block wizard-info-warn">
+        <div class="wizard-info-body">
+          <strong>What this means:</strong>
+          <ul style="margin:6px 0 0 18px;padding:0">
+            <li>No syncing across devices</li>
+            <li>No syncing with family members</li>
+            <li>If you clear browser data or switch devices, the tracker will be empty</li>
+            <li>You can still use Export / Import to move data manually</li>
+          </ul>
+          <div style="margin-top:10px">You can switch to cloud sync later — click the "Local only" pill in the header.</div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" onclick="wizardBack()">← Back</button>
+        <button class="btn btn-primary" onclick="wizardConfirmLocal()">Yes, use local only</button>
+      </div>
+    </div>
+
+    <!-- ─── Screen 4: phase-4 placeholder for create/pick (Phases 6/7 wire these for real) ─── -->
+    <div id="wizard-screen-4-placeholder" class="hidden">
+      <div class="modal-title" id="wizard-placeholder-title">Almost there…</div>
+      <div class="modal-subtitle" id="wizard-placeholder-subtitle"></div>
+      <div class="wizard-info-block">
+        <div class="wizard-info-body" id="wizard-placeholder-body"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-primary" onclick="closeWizard()">OK</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="spotlight-overlay" style="display:none;position:fixed;inset:0;z-index:9000;background:rgba(0,0,0,0.6);align-items:center;justify-content:center;padding:20px" onclick="if(event.target===this)closeSpotlightOverlay()">
   <div style="background:var(--color-background-secondary);border:1px solid var(--color-border-secondary);border-radius:var(--border-radius-lg);padding:28px;max-width:520px;width:100%;position:relative;box-shadow:0 20px 60px rgba(0,0,0,0.5)">
     <button onclick="closeSpotlightOverlay()" style="position:absolute;top:12px;right:14px;background:none;border:none;color:var(--color-text-tertiary);font-size:18px;cursor:pointer;line-height:1">✕</button>
@@ -1573,10 +1752,14 @@ function setSyncState(newState) {
 }
 
 function onSyncIndicatorClick() {
-  // Only authNeeded is clickable in current phase; others no-op.
-  // Phase 3 will wire this to the re-auth popup.
+  if (syncState === 'localOnly') {
+    // User wants to enable cloud sync — open the wizard
+    openWizard();
+    return;
+  }
   if (syncState === 'authNeeded') {
-    console.log('Re-auth click — Phase 3 will handle this');
+    // Phase 5 will wire this to a re-auth popup
+    console.log('Re-auth click — Phase 5 will handle this');
   }
 }
 
@@ -1643,8 +1826,8 @@ document.addEventListener('keydown', (e) => {
 //   - API Key is restricted to HTTP referrers (same origins) + Picker API only
 // Google explicitly sanctions exposing these in client-side code.
 // ─────────────────────────────────────────────
-const GOOGLE_OAUTH_CLIENT_ID = '399383645070-6ev75hkrb0a77dg1vg1ta8lsjpd4tf28.apps.googleusercontent.com';
-const GOOGLE_API_KEY = 'AIzaSyA10_DdeZ-Ld5cb3gI4P_b_tPH0KbU6yZk';
+const GOOGLE_OAUTH_CLIENT_ID = 'PASTE_OAUTH_CLIENT_ID_HERE';
+const GOOGLE_API_KEY = 'PASTE_API_KEY_HERE';
 
 // ─────────────────────────────────────────────
 // GoogleAuth module — OAuth implicit flow via Google Identity Services.
@@ -1809,26 +1992,225 @@ const GoogleAuth = (function() {
   return { init, signIn, signOut, getToken, isSignedIn, onTokenExpiry, _updateDevAuthStatus: updateDevAuthStatus };
 })();
 
-// Dev-mode UI: show test buttons if ?devauth=1 in URL.
-// Removed in Phase 4 once real setup wizard exists.
-(function setupDevAuth() {
-  const params = new URLSearchParams(window.location.search);
-  if (params.get('devauth') !== '1') return;
-  const showWhenReady = () => {
-    const ids = ['devauth-signin', 'devauth-signout', 'devauth-status'];
-    ids.forEach(id => {
-      const el = document.getElementById(id);
-      if (el) el.style.display = '';
-    });
-    GoogleAuth._updateDevAuthStatus();
-    // Refresh the "Xm left" countdown every 30s
-    setInterval(() => GoogleAuth._updateDevAuthStatus(), 30000);
-    console.log('[dev] OAuth test buttons enabled (?devauth=1)');
+// ─────────────────────────────────────────────
+// Setup wizard
+//
+// Three paths a user can take on first run:
+//   create — sign in with Google, create a new Drive file (Phase 6 wires this)
+//   pick   — sign in, pick existing file via Google Picker (Phase 7 wires this)
+//   local  — no cloud, localStorage only
+//
+// Wizard state lives in localStorage under 'setup-status':
+//   null              — wizard appears on load (default for new users)
+//   'pending-create'  — user picked Create but didn't finish (Phase 6 incomplete)
+//   'pending-pick'    — user picked Pick but didn't finish (Phase 7 incomplete)
+//   'cloud-configured' — Drive is fully wired (Phases 6/7 set this)
+//   'local-only'      — user explicitly chose local-only
+//
+// Wizard appears on load only if status is null/pending-*. Configured users
+// (cloud or local) don't see it. Local-only users can re-open it from the
+// header by clicking the "Local only" sync indicator pill.
+//
+// Display name is stored in localStorage under 'display-name' (per-device).
+// ─────────────────────────────────────────────
+const SETUP_STATUS_KEY = 'setup-status';
+const DISPLAY_NAME_KEY = 'display-name';
+
+// These read/write outside the family- prefixed Storage abstraction because
+// they are device-local config, not portable family data. Always localStorage.
+function getSetupStatus() {
+  try { return localStorage.getItem('family-' + SETUP_STATUS_KEY); }
+  catch(e) { return null; }
+}
+function setSetupStatus(v) {
+  try { localStorage.setItem('family-' + SETUP_STATUS_KEY, v); }
+  catch(e) { console.warn('setSetupStatus failed', e); }
+}
+function getDisplayName() {
+  try { return localStorage.getItem('family-' + DISPLAY_NAME_KEY) || ''; }
+  catch(e) { return ''; }
+}
+function setDisplayName(v) {
+  try { localStorage.setItem('family-' + DISPLAY_NAME_KEY, v); }
+  catch(e) { console.warn('setDisplayName failed', e); }
+}
+
+// Wizard runtime state — which screen is showing, which path was picked.
+// Reset on every wizard open.
+let wizardCurrentScreen = 1;
+let wizardChosenPath = null;  // 'create' | 'pick' | 'local'
+
+function openWizard() {
+  wizardCurrentScreen = 1;
+  wizardChosenPath = null;
+  // Reset all screens to hidden, show screen 1
+  ['wizard-screen-1', 'wizard-screen-2', 'wizard-screen-3-create',
+   'wizard-screen-3-pick', 'wizard-screen-3-local', 'wizard-screen-4-placeholder']
+    .forEach(id => document.getElementById(id).classList.add('hidden'));
+  document.getElementById('wizard-screen-1').classList.remove('hidden');
+  // Pre-fill display name input from any saved value
+  const nameInput = document.getElementById('wizard-displayname-input');
+  if (nameInput) {
+    nameInput.value = getDisplayName();
+    updateNameContinueButton();
+  }
+  document.getElementById('setup-wizard-modal').classList.remove('hidden');
+}
+
+function closeWizard() {
+  document.getElementById('setup-wizard-modal').classList.add('hidden');
+}
+
+function wizardChoosePath(path) {
+  wizardChosenPath = path;
+  document.getElementById('wizard-screen-1').classList.add('hidden');
+  if (path === 'local') {
+    // Skip name screen for local-only — name isn't used without cloud
+    document.getElementById('wizard-screen-3-local').classList.remove('hidden');
+    wizardCurrentScreen = 3;
+  } else {
+    // create or pick — go to display name screen first
+    document.getElementById('wizard-screen-2').classList.remove('hidden');
+    wizardCurrentScreen = 2;
+    setTimeout(() => {
+      const input = document.getElementById('wizard-displayname-input');
+      if (input) input.focus();
+    }, 50);
+  }
+}
+
+function wizardBack() {
+  // Hide all screens except 1, then show the appropriate prior screen
+  ['wizard-screen-2', 'wizard-screen-3-create', 'wizard-screen-3-pick', 'wizard-screen-3-local']
+    .forEach(id => document.getElementById(id).classList.add('hidden'));
+  if (wizardCurrentScreen === 3 && wizardChosenPath !== 'local') {
+    // We were on screen 3 of create/pick — back goes to name screen (2)
+    document.getElementById('wizard-screen-2').classList.remove('hidden');
+    wizardCurrentScreen = 2;
+  } else {
+    // Back to screen 1
+    document.getElementById('wizard-screen-1').classList.remove('hidden');
+    wizardCurrentScreen = 1;
+    wizardChosenPath = null;
+  }
+}
+
+function updateNameContinueButton() {
+  const input = document.getElementById('wizard-displayname-input');
+  const btn = document.getElementById('wizard-name-continue');
+  if (!input || !btn) return;
+  const trimmed = (input.value || '').trim();
+  btn.disabled = trimmed.length === 0;
+}
+
+function wizardConfirmName() {
+  const input = document.getElementById('wizard-displayname-input');
+  const trimmed = (input.value || '').trim();
+  if (trimmed.length === 0) return;
+  setDisplayName(trimmed);
+  // Now show the path-specific screen 3
+  document.getElementById('wizard-screen-2').classList.add('hidden');
+  if (wizardChosenPath === 'create') {
+    document.getElementById('wizard-screen-3-create').classList.remove('hidden');
+  } else if (wizardChosenPath === 'pick') {
+    document.getElementById('wizard-screen-3-pick').classList.remove('hidden');
+  }
+  wizardCurrentScreen = 3;
+}
+
+// Path-specific actions on screen 3.
+// Phase 4: these hand off to OAuth and then show a placeholder for now.
+// Phases 6/7 will replace the placeholder with real Drive create / Picker.
+
+async function wizardCreateFile() {
+  // Ensure we have an OAuth token. Sign in if needed.
+  if (!GoogleAuth.isSignedIn()) {
+    GoogleAuth.signIn();
+    // signIn is async; user has to complete popup. We'll wait for token.
+    const ok = await waitForToken(15000);
+    if (!ok) {
+      // User cancelled or popup failed — stay on this screen
+      return;
+    }
+  }
+  // Phase 6 will: create Drive file, store its ID, switch backend, seed write.
+  // For Phase 4 we record the in-flight state and show a placeholder.
+  setSetupStatus('pending-create');
+  showPlaceholder(
+    'Sign-in worked — file creation coming in Phase 6',
+    'You\'re signed into Google. Phase 6 will wire up actually creating the Drive file. For now this just confirms OAuth handed off correctly.',
+    'OK'
+  );
+}
+
+async function wizardPickFile() {
+  if (!GoogleAuth.isSignedIn()) {
+    GoogleAuth.signIn();
+    const ok = await waitForToken(15000);
+    if (!ok) return;
+  }
+  setSetupStatus('pending-pick');
+  showPlaceholder(
+    'Sign-in worked — Picker coming in Phase 7',
+    'You\'re signed into Google. Phase 7 will wire up the Google Picker so you can choose a shared file. For now this just confirms OAuth handed off correctly.',
+    'OK'
+  );
+}
+
+function wizardConfirmLocal() {
+  setSetupStatus('local-only');
+  setSyncState('localOnly');
+  closeWizard();
+}
+
+function showPlaceholder(title, body, btnText) {
+  ['wizard-screen-1', 'wizard-screen-2', 'wizard-screen-3-create',
+   'wizard-screen-3-pick', 'wizard-screen-3-local']
+    .forEach(id => document.getElementById(id).classList.add('hidden'));
+  document.getElementById('wizard-placeholder-title').textContent = title;
+  document.getElementById('wizard-placeholder-subtitle').textContent = '';
+  document.getElementById('wizard-placeholder-body').textContent = body;
+  document.getElementById('wizard-screen-4-placeholder').classList.remove('hidden');
+  wizardCurrentScreen = 4;
+}
+
+// Helper: wait up to `timeoutMs` for GoogleAuth to acquire a token.
+// Resolves true on success, false on timeout. Used after triggering signIn().
+function waitForToken(timeoutMs) {
+  return new Promise(resolve => {
+    const start = Date.now();
+    (function check() {
+      if (GoogleAuth.isSignedIn()) return resolve(true);
+      if (Date.now() - start > timeoutMs) return resolve(false);
+      setTimeout(check, 200);
+    })();
+  });
+}
+
+// On load: open wizard if user hasn't configured anything yet.
+// Defer until DOM is ready and GoogleAuth has had a chance to init.
+(function maybeOpenWizardOnLoad() {
+  const ensureReady = () => {
+    const status = getSetupStatus();
+    // Open if no status, or if user started but didn't complete a cloud path
+    if (status === null || status === 'pending-create' || status === 'pending-pick') {
+      openWizard();
+    }
+    // Wire the displayname input's enable/disable dance
+    const nameInput = document.getElementById('wizard-displayname-input');
+    if (nameInput) {
+      nameInput.addEventListener('input', updateNameContinueButton);
+      nameInput.addEventListener('keydown', e => {
+        if (e.key === 'Enter' && !document.getElementById('wizard-name-continue').disabled) {
+          wizardConfirmName();
+        }
+      });
+    }
   };
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', showWhenReady);
+    document.addEventListener('DOMContentLoaded', ensureReady);
   } else {
-    showWhenReady();
+    ensureReady();
   }
 })();
 
