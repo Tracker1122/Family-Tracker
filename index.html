@@ -413,6 +413,11 @@
     50%      { opacity: 0.35; }
   }
 
+  /* Spinner used in wizard create-in-progress screen */
+  @keyframes wizard-spin {
+    to { transform: rotate(360deg); }
+  }
+
   /* Last-edited indicator — sits next to sync indicator. Hidden in localOnly. */
   .last-edited {
     font-size: 10px;
@@ -1600,6 +1605,51 @@
         <button class="btn btn-primary" onclick="closeWizard()">OK</button>
       </div>
     </div>
+
+    <!-- ─── Screen 5: create-in-progress (Phase 6) ─── -->
+    <div id="wizard-screen-5-creating" class="hidden">
+      <div class="modal-title">Setting up cloud sync…</div>
+      <div class="modal-subtitle" id="wizard-creating-status">Creating file in your Google Drive…</div>
+      <div style="display:flex;align-items:center;justify-content:center;padding:20px 0">
+        <div style="width:32px;height:32px;border:3px solid var(--color-border-secondary);border-top-color:var(--color-text-info);border-radius:50%;animation:wizard-spin 1s linear infinite"></div>
+      </div>
+    </div>
+
+    <!-- ─── Screen 6: share-with-family success (Phase 6) ─── -->
+    <div id="wizard-screen-6-share" class="hidden">
+      <div class="modal-title">✓ Cloud sync is on</div>
+      <div class="modal-subtitle">Your tracker now saves to Google Drive. One more thing — share the file with your family so they can edit too.</div>
+      <div class="wizard-info-block wizard-info-warn">
+        <div class="wizard-info-title">How to share</div>
+        <div class="wizard-info-body">
+          <ol style="margin:0 0 0 18px;padding:0;line-height:1.7">
+            <li><a id="wizard-drive-link" href="https://drive.google.com/drive/recent" target="_blank" rel="noopener" style="color:var(--color-text-info);text-decoration:underline">Open Google Drive ↗</a></li>
+            <li>Find <code>family-tracker-data.json</code> (it'll be at the top — recently edited)</li>
+            <li>Right-click → <strong>Share</strong></li>
+            <li>Add your family member's email</li>
+            <li>Set them to <strong>Editor</strong> (not Viewer — they need to make changes)</li>
+            <li>Click Send</li>
+          </ol>
+          <div style="margin-top:10px;font-size:10px;color:var(--color-text-tertiary)">They'll then sign into the tracker and use "Open an existing family tracker" to find it under <em>Shared with me</em>.</div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-primary" onclick="closeWizard()">Done</button>
+      </div>
+    </div>
+
+    <!-- ─── Screen 7: create-error (Phase 6) ─── -->
+    <div id="wizard-screen-7-error" class="hidden">
+      <div class="modal-title">Something went wrong</div>
+      <div class="modal-subtitle">We couldn't finish setting up cloud sync.</div>
+      <div class="wizard-info-block" style="border-color:var(--color-text-danger)">
+        <div class="wizard-info-body" id="wizard-error-body" style="color:var(--color-text-danger)"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" onclick="wizardBack()">← Back</button>
+        <button class="btn btn-primary" onclick="wizardCreateFile()">Try again</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -2578,11 +2628,7 @@ let wizardChosenPath = null;  // 'create' | 'pick' | 'local'
 function openWizard() {
   wizardCurrentScreen = 1;
   wizardChosenPath = null;
-  // Reset all screens to hidden, show screen 1
-  ['wizard-screen-1', 'wizard-screen-2', 'wizard-screen-3-create',
-   'wizard-screen-3-pick', 'wizard-screen-3-local', 'wizard-screen-4-placeholder']
-    .forEach(id => document.getElementById(id).classList.add('hidden'));
-  document.getElementById('wizard-screen-1').classList.remove('hidden');
+  showWizardScreen('wizard-screen-1');
   // Pre-fill display name input from any saved value
   const nameInput = document.getElementById('wizard-displayname-input');
   if (nameInput) {
@@ -2598,14 +2644,13 @@ function closeWizard() {
 
 function wizardChoosePath(path) {
   wizardChosenPath = path;
-  document.getElementById('wizard-screen-1').classList.add('hidden');
   if (path === 'local') {
     // Skip name screen for local-only — name isn't used without cloud
-    document.getElementById('wizard-screen-3-local').classList.remove('hidden');
+    showWizardScreen('wizard-screen-3-local');
     wizardCurrentScreen = 3;
   } else {
     // create or pick — go to display name screen first
-    document.getElementById('wizard-screen-2').classList.remove('hidden');
+    showWizardScreen('wizard-screen-2');
     wizardCurrentScreen = 2;
     setTimeout(() => {
       const input = document.getElementById('wizard-displayname-input');
@@ -2615,19 +2660,27 @@ function wizardChoosePath(path) {
 }
 
 function wizardBack() {
-  // Hide all screens except 1, then show the appropriate prior screen
-  ['wizard-screen-2', 'wizard-screen-3-create', 'wizard-screen-3-pick', 'wizard-screen-3-local']
-    .forEach(id => document.getElementById(id).classList.add('hidden'));
-  if (wizardCurrentScreen === 3 && wizardChosenPath !== 'local') {
-    // We were on screen 3 of create/pick — back goes to name screen (2)
-    document.getElementById('wizard-screen-2').classList.remove('hidden');
-    wizardCurrentScreen = 2;
-  } else {
-    // Back to screen 1
-    document.getElementById('wizard-screen-1').classList.remove('hidden');
-    wizardCurrentScreen = 1;
-    wizardChosenPath = null;
+  // Where Back goes depends on the current screen.
+  if (wizardCurrentScreen === 7) {
+    // From error screen, back goes to the create or pick instructions screen
+    if (wizardChosenPath === 'create') {
+      showWizardScreen('wizard-screen-3-create');
+    } else {
+      showWizardScreen('wizard-screen-3-pick');
+    }
+    wizardCurrentScreen = 3;
+    return;
   }
+  if (wizardCurrentScreen === 3 && wizardChosenPath !== 'local') {
+    // From create/pick instructions, back goes to name screen
+    showWizardScreen('wizard-screen-2');
+    wizardCurrentScreen = 2;
+    return;
+  }
+  // Default: back to screen 1
+  showWizardScreen('wizard-screen-1');
+  wizardCurrentScreen = 1;
+  wizardChosenPath = null;
 }
 
 function updateNameContinueButton() {
@@ -2644,11 +2697,10 @@ function wizardConfirmName() {
   if (trimmed.length === 0) return;
   setDisplayName(trimmed);
   // Now show the path-specific screen 3
-  document.getElementById('wizard-screen-2').classList.add('hidden');
   if (wizardChosenPath === 'create') {
-    document.getElementById('wizard-screen-3-create').classList.remove('hidden');
+    showWizardScreen('wizard-screen-3-create');
   } else if (wizardChosenPath === 'pick') {
-    document.getElementById('wizard-screen-3-pick').classList.remove('hidden');
+    showWizardScreen('wizard-screen-3-pick');
   }
   wizardCurrentScreen = 3;
 }
@@ -2658,24 +2710,104 @@ function wizardConfirmName() {
 // Phases 6/7 will replace the placeholder with real Drive create / Picker.
 
 async function wizardCreateFile() {
-  // Ensure we have an OAuth token. Sign in if needed.
+  // Phase 6: real flow.
+  // 1. Sign in (popup if needed)
+  // 2. Show "creating…" progress screen
+  // 3. Create Drive file via createDriveFile()
+  // 4. Migrate any existing localStorage data into DriveBackend cache
+  // 5. Activate DriveBackend
+  // 6. Push initial state to Drive (so migrated data is saved)
+  // 7. Mark setup-status as cloud-configured
+  // 8. Show share-with-family screen
+  //
+  // On any failure: show error screen with retry option. setup-status stays
+  // as 'pending-create' so wizard reappears next load if user closes.
+
+  // Step 1: ensure we have an OAuth token
   if (!GoogleAuth.isSignedIn()) {
     GoogleAuth.signIn();
-    // signIn is async; user has to complete popup. We'll wait for token.
     const ok = await waitForToken(15000);
     if (!ok) {
-      // User cancelled or popup failed — stay on this screen
+      // User cancelled or popup failed — stay on the create screen
       return;
     }
   }
-  // Phase 6 will: create Drive file, store its ID, switch backend, seed write.
-  // For Phase 4 we record the in-flight state and show a placeholder.
+
   setSetupStatus('pending-create');
-  showPlaceholder(
-    'Sign-in worked — file creation coming in Phase 6',
-    'You\'re signed into Google. Phase 6 will wire up actually creating the Drive file. For now this just confirms OAuth handed off correctly.',
-    'OK'
-  );
+  showWizardScreen('wizard-screen-5-creating');
+  setWizardCreatingStatus('Creating file in your Google Drive…');
+
+  try {
+    // Step 3: create the file. Returns { fileId, name, version }.
+    const created = await createDriveFile();
+    setWizardCreatingStatus('File created. Migrating local data…');
+
+    // Step 4: pull any existing data out of LocalStorageBackend so it's not lost
+    // when we switch backends. The 5 family-data keys.
+    const FAMILY_KEYS = ['positions-v2', 'positions-closed', 'sp-data', 'ledger', 'snapshots-v1'];
+    const localData = {};
+    let hadLocalData = false;
+    for (const key of FAMILY_KEYS) {
+      const raw = await LocalStorageBackend.get(key);
+      if (raw !== null) {
+        try {
+          localData[key] = JSON.parse(raw);
+          hadLocalData = true;
+        } catch(e) {
+          console.warn('[wizard] local data for', key, 'is not valid JSON, skipping');
+        }
+      }
+    }
+
+    // Step 5: configure DriveBackend with the new file ID + version
+    setDriveFileId(created.fileId);
+    DriveBackend.reset();
+    setActiveBackend(DriveBackend);
+    DriveBackend._debug.setVersion(created.version);
+
+    // Step 6: if we had local data, push it to Drive. We do this by setting
+    // each key on DriveBackend (which updates cache + persists locally) and
+    // then flushing immediately so user sees the synced state right away.
+    if (hadLocalData) {
+      setWizardCreatingStatus('Pushing your existing data to Drive…');
+      for (const key of Object.keys(localData)) {
+        await DriveBackend.set(key, JSON.stringify(localData[key]));
+      }
+      await DriveBackend.flushNow();
+    }
+
+    // Step 7: mark setup complete
+    setSetupStatus('cloud-configured');
+    setSyncState('synced');
+
+    // Step 8: show share-with-family screen
+    showWizardScreen('wizard-screen-6-share');
+  } catch(e) {
+    console.warn('[wizard] create flow failed:', e.message);
+    showWizardScreen('wizard-screen-7-error');
+    document.getElementById('wizard-error-body').textContent =
+      'Error: ' + e.message + '. Your data is still safe locally — try again or pick a different option.';
+  }
+}
+
+// Helper used by Phase 6 flows to switch to a single wizard screen.
+// Hides all other screens, shows the requested one.
+function showWizardScreen(screenId) {
+  ['wizard-screen-1', 'wizard-screen-2', 'wizard-screen-3-create',
+   'wizard-screen-3-pick', 'wizard-screen-3-local',
+   'wizard-screen-4-placeholder', 'wizard-screen-5-creating',
+   'wizard-screen-6-share', 'wizard-screen-7-error']
+    .forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.classList.add('hidden');
+    });
+  const target = document.getElementById(screenId);
+  if (target) target.classList.remove('hidden');
+}
+
+function setWizardCreatingStatus(msg) {
+  const el = document.getElementById('wizard-creating-status');
+  if (el) el.textContent = msg;
 }
 
 async function wizardPickFile() {
