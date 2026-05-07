@@ -3113,24 +3113,35 @@ async function wizardPickFile() {
   setSetupStatus('pending-pick');
 
   // Step 2: open the Picker. show() resolves to {fileId,name,mimeType} or null.
+  // The wizard modal would otherwise sit on top of the Picker iframe and
+  // intercept clicks, so hide it while the Picker is in front. Restore on
+  // cancel / error so the user can try again or back out.
+  const wizardModal = document.getElementById('setup-wizard-modal');
+  const wizardWasVisible = wizardModal && !wizardModal.classList.contains('hidden');
+  if (wizardWasVisible) wizardModal.classList.add('hidden');
+
   let picked;
   try {
     picked = await GooglePicker.show();
   } catch(e) {
     console.warn('[wizard.pick] Picker init/show failed:', e.message);
+    if (wizardWasVisible) wizardModal.classList.remove('hidden');
     showWizardScreen('wizard-screen-7-error');
     document.getElementById('wizard-error-body').textContent =
       'Couldn\'t open the Google Picker: ' + e.message + '. Your data is still safe locally.';
     return;
   }
   if (!picked) {
-    // Cancel — leave user on the pick instructions screen, no error shown
+    // Cancel — restore the wizard to the pick instructions screen
     console.log('[wizard.pick] user cancelled Picker');
+    if (wizardWasVisible) wizardModal.classList.remove('hidden');
     return;
   }
 
   // Step 3: check for non-trivial local data. If present, route to confirm
-  // screen; otherwise proceed straight to load.
+  // screen; otherwise proceed straight to load. In either case the wizard
+  // needs to be visible again to show the next screen.
+  if (wizardWasVisible) wizardModal.classList.remove('hidden');
   _pickedFileForReplace = picked;
   const local = summarizeLocalFamilyData();
   if (local.isEmpty) {
