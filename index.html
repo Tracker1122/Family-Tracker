@@ -793,10 +793,21 @@
     <button id="refresh-prices-btn" class="btn btn-sm btn-primary" onclick="refreshAllPrices()" style="font-size:10px;padding:4px 12px">⟳ Refresh Prices</button>
     <button id="get-benchmarks-btn" class="btn btn-sm" onclick="getBenchmarkPrices()" style="font-size:10px;padding:4px 12px" title="Fetches benchmark ETF prices (QQQ, SMH, CIBR, XLF, XLE, GLD, XLY, ITA, SPHQ) — needed for snapshots and benchmark display">⟳ Get Benchmarks</button>
     <button id="backfill-btn" class="btn btn-sm" onclick="backfillThemeBenchmarks()" style="font-size:10px;padding:4px 12px" title="One-time historical fetch of benchmark prices on each position's buy/sell dates. Enables theme-relative alpha math.">⟳ Backfill Theme Benchmarks</button>
+    <button id="backfill-spx-btn" class="btn btn-sm" onclick="backfillSpxAtBuy()" style="font-size:10px;padding:4px 12px" title="Fetches the S&P 500 close on each position's buy date (and sell date for closed positions) via Yahoo Finance. Fills the S&P Buy / S&P Exit columns where blank.">⟳ Backfill S&amp;P at Buy</button>
     <span id="refresh-status" style="font-size:10px;color:var(--color-text-tertiary)"></span>
     <span id="benchmark-status" style="font-size:10px;color:var(--color-text-tertiary)"></span>
     <span id="backfill-status" style="font-size:10px;color:var(--color-text-tertiary)"></span>
+    <span id="backfill-spx-status" style="font-size:10px;color:var(--color-text-tertiary)"></span>
     <span id="polygon-key-toggle" style="font-size:10px;color:var(--color-text-tertiary);cursor:pointer;text-decoration:underline" onclick="togglePolygonKey()">API Key</span>
+  </div>
+</div>
+
+<!-- Failure list for backfill S&P at Buy. Hidden until populated. -->
+<div id="backfill-spx-failures" class="hidden" style="background:var(--color-background-secondary);border-bottom:1px solid var(--color-border-tertiary);padding:8px 20px;font-size:10px;color:var(--color-text-tertiary);font-family:var(--font-mono)">
+  <div style="display:flex;align-items:center;gap:10px">
+    <span style="color:#fbbf24">⚠ S&P backfill — these rows didn't fetch:</span>
+    <span id="backfill-spx-failures-list" style="color:var(--color-text-secondary)"></span>
+    <span style="margin-left:auto;color:var(--color-text-tertiary);font-style:italic">Click "⟳ Backfill S&amp;P at Buy" again to retry. If they fail repeatedly, check the buy date — Yahoo may not have S&amp;P data for that day.</span>
   </div>
 </div>
 
@@ -5552,7 +5563,114 @@ async function backfillThemeBenchmarks() {
   renderAll();
 }
 
-// Compute theme-relative alpha for a position, using the historical benchmark anchor.
+// ─────────────────────────────────────────────
+// Bulk backfill of S&P 500 at buy date (and sell date for closed positions).
+// Mirrors the per-row Fetch button's S&P logic but applied across all
+// positions that need it. Useful after a CSV import drops 50+ open lots
+// with blank spxBuy.
+//
+// Source: Yahoo Finance (same endpoint as fetchSpxHistorical).
+// Rate limit: Yahoo is much more lenient than Polygon, so we go 5 in
+//   parallel with a 1s pause between batches. If we start hitting 429s
+//   in practice we can back off — this is the optimistic setting.
+// Targets: positions with a buy date and blank spxBuy. For closed
+//   positions we also fetch the exit-date S&P if blank.
+// ─────────────────────────────────────────────
+async function backfillSpxAtBuy() {
+  const status = document.getElementById('backfill-spx-status');
+  const btn = document.getElementById('backfill-spx-btn');
+  const failuresEl = document.getElementById('backfill-spx-failures');
+  const failuresListEl = document.getElementById('backfill-spx-failures-list');
+
+  // Clear any previous failure list — each click does a fresh scan.
+  if (failuresEl) failuresEl.classList.add('hidden');
+  if (failuresListEl) failuresListEl.textContent = '';
+
+  // Build the work list. Each item is { id, kind: 'buy'|'sell', date }.
+  const targets = [];
+  for (const pos of positions) {
+    if (pos.dateBought && !pos.spxBuy) {
+      targets.push({ id: pos.id, kind: 'buy', date: pos.dateBought });
+    }
+    if (pos.closed && pos.sellDate && !pos.spxExit) {
+      targets.push({ id: pos.id, kind: 'sell', date: pos.sellDate });
+    }
+  }
+
+  if (targets.length === 0) {
+    status.textContent = 'Nothing to backfill — all positions already have S&P values';
+    status.style.color = 'var(--color-text-success)';
+    return;
+  }
+
+  btn.disabled = true; btn.textContent = '⟳ Backfilling…';
+  status.textContent = `Fetching ${targets.length} historical S&P values...`;
+  status.style.color = '#fbbf24';
+
+  const batchSize = 5;
+  const waitMs = 1000;
+  let succeeded = 0;
+  const failed = [];   // [{ ticker, kind, date }] for visible reporting
+
+  for (let i = 0; i < targets.length; i += batchSize) {
+    const batch = targets.slice(i, i + batchSize);
+    const batchResults = await Promise.all(
+      batch.map(t => fetchSpxHistorical(t.date)
+        .then(price => ({ ...t, price }))
+        .catch(e => ({ ...t, price: null, error: e.message })))
+    );
+
+    batchResults.forEach(r => {
+      const pos = positions.find(p => p.id === r.id);
+      if (!pos) return;
+      if (r.price === null) {
+        failed.push({ ticker: pos.ticker || '?', kind: r.kind, date: r.date });
+        return;
+      }
+      if (r.kind === 'buy') {
+        pos.spxBuy = r.price.toFixed(2);
+      } else if (r.kind === 'sell') {
+        pos.spxExit = r.price.toFixed(2);
+      }
+      succeeded++;
+    });
+
+    const done = Math.min(i + batchSize, targets.length);
+    let msg = `${done}/${targets.length} fetched`;
+    if (failed.length > 0) msg += ` · ${failed.length} failed so far`;
+    status.textContent = msg;
+
+    if (i + batchSize < targets.length) {
+      await new Promise(r => setTimeout(r, waitMs));
+    }
+  }
+
+  btn.disabled = false;
+  btn.textContent = '⟳ Backfill S&P at Buy';
+
+  const ts = new Date().toLocaleTimeString();
+  if (failed.length === 0) {
+    status.textContent = `✓ Backfilled ${succeeded} S&P values · ${ts}`;
+    status.style.color = 'var(--color-text-success)';
+  } else if (succeeded > 0) {
+    status.textContent = `${succeeded} succeeded · ${failed.length} failed · ${ts}`;
+    status.style.color = '#fbbf24';
+  } else {
+    status.textContent = `All ${failed.length} fetches failed · ${ts}`;
+    status.style.color = 'var(--color-text-danger)';
+  }
+
+  // Surface failures visibly so the user knows which rows need attention.
+  if (failed.length > 0 && failuresEl && failuresListEl) {
+    const items = failed.map(f => `${f.ticker} ${f.kind}@${f.date}`);
+    failuresListEl.textContent = items.join('  ·  ');
+    failuresEl.classList.remove('hidden');
+    console.warn('[backfillSpxAtBuy] failed targets:', failed);
+  }
+
+  scheduleSave();
+  renderAll();
+}
 // For open positions: compares your-return-since-buy against benchmark-return-since-buy.
 // For closed positions: compares your-return-buy-to-sell against benchmark-return-buy-to-sell.
 // Returns null when data is missing (no benchmark for theme, no buy-date data, etc.).
