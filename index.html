@@ -5481,6 +5481,52 @@ async function fetchHistoricalBenchmarkPrice(ticker, date) {
   }
 }
 
+// Fetch the S&P 500 close on a given date, via Polygon. Tries I:SPX first
+// (the actual index). If that fails (free tier may not include indices),
+// surfaces the error to the caller — we don't silently substitute SPY,
+// which would change the magnitude of stored spxBuy values and corrupt
+// the calculation math.
+//
+// Walk-forward: like the Yahoo-based fetchSpxHistorical, we try up to 7
+// days from the requested date to handle weekends/holidays. Polygon's
+// open-close endpoint returns 'NOT_FOUND' for non-trading days, so we
+// step day-by-day until we find data or give up.
+async function fetchHistoricalSpxPolygon(dateStr) {
+  if (!polygonKey) return { price: null, error: 'no API key' };
+  const start = new Date(dateStr + 'T12:00:00Z');
+  for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
+    const d = new Date(start.getTime() + dayOffset * 86400 * 1000);
+    const iso = d.toISOString().slice(0, 10);
+    const url = `https://api.polygon.io/v1/open-close/I:SPX/${iso}?adjusted=true&apiKey=${polygonKey}`;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeoutId);
+      if (res.status === 403) {
+        // Indices likely not on free tier — surface this clearly so the
+        // caller can show a useful message.
+        return { price: null, error: 'I:SPX not available on this Polygon tier (403)' };
+      }
+      if (!res.ok) {
+        // 404 / 429 / other — try next day
+        if (dayOffset === 6) return { price: null, error: `HTTP ${res.status} after 7-day walk` };
+        continue;
+      }
+      const data = await res.json();
+      if (data.status === 'OK' && typeof data.close === 'number') {
+        return { price: data.close, error: null };
+      }
+      // NOT_FOUND for weekends/holidays — keep walking
+      if (dayOffset === 6) return { price: null, error: 'no S&P data within 7 days' };
+    } catch (e) {
+      clearTimeout(timeoutId);
+      if (dayOffset === 6) return { price: null, error: e.message || 'network error' };
+    }
+  }
+  return { price: null, error: 'no data found' };
+}
+
 async function backfillThemeBenchmarks() {
   const keyInput = document.getElementById('polygon-key-input');
   if (keyInput && keyInput.value.trim()) polygonKey = keyInput.value.trim();
@@ -5586,6 +5632,17 @@ async function backfillSpxAtBuy() {
   if (failuresEl) failuresEl.classList.add('hidden');
   if (failuresListEl) failuresListEl.textContent = '';
 
+  // Ensure we have a Polygon key — same prompt the other backfill uses.
+  const keyInput = document.getElementById('polygon-key-input');
+  if (keyInput && keyInput.value.trim()) polygonKey = keyInput.value.trim();
+  if (!polygonKey) await loadPolygonKey();
+  if (!polygonKey) {
+    togglePolygonKey();
+    status.textContent = 'Enter your Polygon API key first';
+    status.style.color = '#fbbf24';
+    return;
+  }
+
   // Build the work list. Each item is { id, kind: 'buy'|'sell', date }.
   const targets = [];
   for (const pos of positions) {
@@ -5604,27 +5661,32 @@ async function backfillSpxAtBuy() {
   }
 
   btn.disabled = true; btn.textContent = '⟳ Backfilling…';
-  status.textContent = `Fetching ${targets.length} historical S&P values...`;
+  // Heads-up: Polygon's free tier is ~5 req/min, same cadence as
+  // backfillThemeBenchmarks. 2 in parallel × 25s waits = ~12.5s per pair.
+  const estSeconds = Math.ceil((targets.length / 2)) * 25;
+  status.textContent = `Fetching ${targets.length} historical S&P values (~${Math.ceil(estSeconds / 60)} min on Polygon free tier)...`;
   status.style.color = '#fbbf24';
 
-  const batchSize = 5;
-  const waitMs = 1000;
+  const batchSize = 2;
+  const waitMs = 25000;
   let succeeded = 0;
-  const failed = [];   // [{ ticker, kind, date }] for visible reporting
+  const failed = [];   // [{ ticker, kind, date, reason }] for visible reporting
+  let sawTierError = false;  // if true, abort early — every other call will hit the same wall
 
   for (let i = 0; i < targets.length; i += batchSize) {
+    if (sawTierError) break;
     const batch = targets.slice(i, i + batchSize);
     const batchResults = await Promise.all(
-      batch.map(t => fetchSpxHistorical(t.date)
-        .then(price => ({ ...t, price }))
-        .catch(e => ({ ...t, price: null, error: e.message })))
+      batch.map(t => fetchHistoricalSpxPolygon(t.date)
+        .then(r => ({ ...t, ...r })))
     );
 
     batchResults.forEach(r => {
       const pos = positions.find(p => p.id === r.id);
       if (!pos) return;
       if (r.price === null) {
-        failed.push({ ticker: pos.ticker || '?', kind: r.kind, date: r.date });
+        if (r.error && r.error.includes('not available on this Polygon tier')) sawTierError = true;
+        failed.push({ ticker: pos.ticker || '?', kind: r.kind, date: r.date, reason: r.error || 'unknown' });
         return;
       }
       if (r.kind === 'buy') {
@@ -5640,7 +5702,7 @@ async function backfillSpxAtBuy() {
     if (failed.length > 0) msg += ` · ${failed.length} failed so far`;
     status.textContent = msg;
 
-    if (i + batchSize < targets.length) {
+    if (i + batchSize < targets.length && !sawTierError) {
       await new Promise(r => setTimeout(r, waitMs));
     }
   }
@@ -5649,7 +5711,10 @@ async function backfillSpxAtBuy() {
   btn.textContent = '⟳ Backfill S&P at Buy';
 
   const ts = new Date().toLocaleTimeString();
-  if (failed.length === 0) {
+  if (sawTierError) {
+    status.textContent = `S&P index (I:SPX) not available on your Polygon tier · ${ts}`;
+    status.style.color = 'var(--color-text-danger)';
+  } else if (failed.length === 0) {
     status.textContent = `✓ Backfilled ${succeeded} S&P values · ${ts}`;
     status.style.color = 'var(--color-text-success)';
   } else if (succeeded > 0) {
@@ -5662,8 +5727,12 @@ async function backfillSpxAtBuy() {
 
   // Surface failures visibly so the user knows which rows need attention.
   if (failed.length > 0 && failuresEl && failuresListEl) {
-    const items = failed.map(f => `${f.ticker} ${f.kind}@${f.date}`);
-    failuresListEl.textContent = items.join('  ·  ');
+    if (sawTierError) {
+      failuresListEl.innerHTML = '<strong>Polygon\'s free tier doesn\'t include S&P 500 index data (I:SPX).</strong> You can: (1) upgrade your Polygon plan to access indices, (2) enter S&P values manually using the multpl.com link, or (3) leave them blank — most calculations work without S&P-at-buy.';
+    } else {
+      const items = failed.map(f => `${f.ticker} ${f.kind}@${f.date}`);
+      failuresListEl.textContent = items.join('  ·  ');
+    }
     failuresEl.classList.remove('hidden');
     console.warn('[backfillSpxAtBuy] failed targets:', failed);
   }
