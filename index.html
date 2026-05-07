@@ -1717,6 +1717,7 @@
     <button class="btn btn-sm btn-danger" onclick="devsyncForceConflict()">6. Force conflict (412 test)</button>
     <button class="btn btn-sm" onclick="devsyncFlushNow()">⚡ Flush write now (skip debounce)</button>
     <button class="btn btn-sm" onclick="devsyncTestPick()">🗂 Test Picker (Phase 7)</button>
+    <button class="btn btn-sm" onclick="devsyncTestSilentAuth()">🔇 Test silent re-auth (Phase 7B)</button>
     <button class="btn btn-sm btn-danger" onclick="devsyncReset()">↺ Reset (clears file ID + cache)</button>
   </div>
   <div id="devsync-status" style="margin-top:8px;padding:6px 8px;background:var(--color-background-tertiary);border-radius:3px;font-size:10px;color:var(--color-text-secondary);min-height:32px;line-height:1.4">Ready. Click 1 first if not signed in, then 2, then 3-6 in any order.</div>
@@ -1908,17 +1909,32 @@ function onSyncIndicatorClick() {
     return;
   }
   if (syncState === 'offline') {
-    // Retry: try a flush, which will attempt to push queued changes
+    // Retry: try a flush, which will attempt to push queued changes.
+    // Phase 7B: if we have no token, try silent re-auth first. The
+    // "offline" state can be triggered by token loss (not a real network
+    // outage), and without this the user clicks the indicator and just
+    // sees the same "not authenticated" error repeat.
     console.log('[sync] manual retry from offline');
-    if (DriveBackend._debug.isQueuedForRetry()) {
-      DriveBackend.flushNow();
-    } else {
-      // No queued write — try a pull to test connectivity
-      setSyncState('syncing');
-      DriveBackend.pullFromDrive()
-        .then(() => setSyncState('synced'))
-        .catch(() => setSyncState('offline'));
-    }
+    (async () => {
+      if (!GoogleAuth.isSignedIn()) {
+        console.log('[sync] no token in memory — attempting silent re-auth before retry');
+        const ok = await GoogleAuth.signInSilent();
+        if (!ok) {
+          // Silent failed — fall back to authNeeded so user can click to sign in
+          setSyncState('authNeeded');
+          return;
+        }
+      }
+      if (DriveBackend._debug.isQueuedForRetry()) {
+        DriveBackend.flushNow();
+      } else {
+        // No queued write — try a pull to test connectivity
+        setSyncState('syncing');
+        DriveBackend.pullFromDrive()
+          .then(() => setSyncState('synced'))
+          .catch(() => setSyncState('offline'));
+      }
+    })();
     return;
   }
 }
@@ -2019,6 +2035,7 @@ const GoogleAuth = (function() {
   let expiryTimer = null;     // setTimeout handle for expiry callback
   let initPromise = null;     // resolves once GIS script + tokenClient are ready
   let expiryCallbacks = [];   // fns to fire when token expires
+  let pendingSilentResolve = null; // resolver fn for an in-flight signInSilent() call
 
   // Wait for window.google.accounts.oauth2 to load. The GIS script is async,
   // so it may not be ready when this module loads. Poll until it is.
@@ -2062,6 +2079,8 @@ const GoogleAuth = (function() {
       console.warn('[GoogleAuth] token response error:', resp.error, resp.error_description || '');
       setSyncState('authNeeded');
       updateDevAuthStatus();
+      // Resolve any pending silent-attempt with failure
+      if (pendingSilentResolve) { pendingSilentResolve(false); pendingSilentResolve = null; }
       return;
     }
     accessToken = resp.access_token;
@@ -2071,6 +2090,8 @@ const GoogleAuth = (function() {
     scheduleExpiryCallback(expiresInMs);
     console.log('[GoogleAuth] ✓ signed in, token expires in ~' + Math.round(expiresInMs / 1000) + 's');
     updateDevAuthStatus();
+    // Resolve any pending silent-attempt with success
+    if (pendingSilentResolve) { pendingSilentResolve(true); pendingSilentResolve = null; }
     // NOTE: we do NOT flip syncState to 'synced' here. That happens in Phase 5
     // after a real Drive operation succeeds. For now, the token exists but
     // there's no Drive backend yet, so syncState stays where it was.
@@ -2080,6 +2101,8 @@ const GoogleAuth = (function() {
     // Fires when user cancels the popup, popup blocked, etc.
     console.warn('[GoogleAuth] token error:', err);
     updateDevAuthStatus();
+    // Resolve any pending silent-attempt with failure
+    if (pendingSilentResolve) { pendingSilentResolve(false); pendingSilentResolve = null; }
   }
 
   function scheduleExpiryCallback(ms) {
@@ -2103,6 +2126,55 @@ const GoogleAuth = (function() {
       console.warn('[GoogleAuth] signIn failed:', e.message);
       alert('Sign-in setup error: ' + e.message);
     }
+  }
+
+  // Phase 7B: Silent re-auth.
+  //
+  // Tries to get a token without showing any UI. Works only if the user has
+  // an active Google session in the browser AND has previously granted this
+  // app the scope. Both conditions are normally true after the user has
+  // completed the wizard's Create or Pick path at least once.
+  //
+  // Used at boot to avoid forcing the user to click "Sign in" every page
+  // reload. If silent fails, the caller is expected to fall back to
+  // showing the visible authNeeded indicator (Option B from the plan).
+  //
+  // Returns a Promise<boolean>: true on success (token obtained), false
+  // on any failure (no session, scope revoked, popup-required, etc.).
+  // Uses a 5s timeout — Google's silent flow normally completes in <1s.
+  async function signInSilent() {
+    try {
+      await init();
+    } catch (e) {
+      console.warn('[GoogleAuth] silent sign-in: init failed:', e.message);
+      return false;
+    }
+    if (pendingSilentResolve) {
+      // Another silent attempt is already in flight. Wait for it instead
+      // of starting a second one.
+      console.warn('[GoogleAuth] silent sign-in already in progress — skipping duplicate');
+      return false;
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      const settle = (value) => {
+        if (settled) return;
+        settled = true;
+        pendingSilentResolve = null;
+        resolve(value);
+      };
+      pendingSilentResolve = settle;
+      // 5s safety timeout. Google's silent flow normally completes in <1s.
+      // If neither callback fires in 5s, treat as failure.
+      setTimeout(() => settle(false), 5000);
+      try {
+        // prompt: 'none' = no UI, fail if interaction needed
+        tokenClient.requestAccessToken({ prompt: 'none' });
+      } catch (e) {
+        console.warn('[GoogleAuth] silent sign-in: requestAccessToken threw:', e.message);
+        settle(false);
+      }
+    });
   }
 
   function signOut() {
@@ -2149,7 +2221,7 @@ const GoogleAuth = (function() {
     }
   }
 
-  return { init, signIn, signOut, getToken, isSignedIn, onTokenExpiry, _updateDevAuthStatus: updateDevAuthStatus };
+  return { init, signIn, signInSilent, signOut, getToken, isSignedIn, onTokenExpiry, _updateDevAuthStatus: updateDevAuthStatus };
 })();
 
 // ─────────────────────────────────────────────
@@ -3457,6 +3529,29 @@ async function devsyncFlushNow() {
     devsyncStatus('✓ Flush complete.', 'ok');
   } catch(e) {
     devsyncStatus('✗ Flush failed: ' + e.message, 'fail');
+  }
+}
+
+// Phase 7B diagnostic — exercise GoogleAuth.signInSilent() in isolation.
+// Useful for: confirming silent re-auth actually works in your browser
+// session without having to reload the page; verifying behavior in
+// Incognito / 3rd-party-cookie-restricted contexts; measuring how long
+// it takes (Google's docs say <1s, but real-world varies).
+async function devsyncTestSilentAuth() {
+  devsyncStatus('Attempting silent re-auth…');
+  const start = Date.now();
+  const wasSignedIn = GoogleAuth.isSignedIn();
+  try {
+    const ok = await GoogleAuth.signInSilent();
+    const elapsed = Date.now() - start;
+    if (ok) {
+      const nowSignedIn = GoogleAuth.isSignedIn();
+      devsyncStatus(`✓ Silent re-auth succeeded in ${elapsed}ms. wasSignedIn=${wasSignedIn}, nowSignedIn=${nowSignedIn}`, 'ok');
+    } else {
+      devsyncStatus(`✗ Silent re-auth failed after ${elapsed}ms. User interaction required.`, 'fail');
+    }
+  } catch (e) {
+    devsyncStatus('✗ Silent re-auth error: ' + e.message, 'fail');
   }
 }
 
@@ -9605,6 +9700,12 @@ async function init() {
   // Phase 5: if user has finished cloud setup, switch to DriveBackend and
   // pull fresh data before loadPositions() runs. If we're offline or auth
   // fails, the cache populated by initFromCache() carries us through.
+  //
+  // Phase 7B: attempt a silent re-auth before falling back to authNeeded.
+  // The user already granted the scope during initial setup, so Google
+  // can usually issue a fresh access token without showing any UI. This
+  // is what makes the page-reload experience seamless instead of
+  // requiring a click-to-sign-in every reload.
   const status = getSetupStatus();
   if (status === 'cloud-configured' && getDriveFileId()) {
     DriveBackend.initFromCache();   // populate from localStorage mirror first
@@ -9612,15 +9713,26 @@ async function init() {
     setSyncState('syncing');
     try {
       await GoogleAuth.init();
-      // Try to acquire a token silently. If it fails, user clicks the
-      // authNeeded indicator to re-auth.
+      // Phase 7B: try silent re-auth. Quick (normally <1s, max 5s timeout).
+      // If it fails, we fall through to authNeeded and the visible
+      // sign-in indicator becomes the user's recovery path.
+      let silentOk = false;
       if (!GoogleAuth.isSignedIn()) {
-        // We can't pop a popup at boot (browser blocks), so flip to authNeeded
-        // and rely on cached data until user re-authenticates.
-        setSyncState('authNeeded');
-      } else {
+        console.log('[init] no token in memory, attempting silent re-auth…');
+        silentOk = await GoogleAuth.signInSilent();
+        if (silentOk) {
+          console.log('[init] ✓ silent re-auth succeeded');
+        } else {
+          console.log('[init] silent re-auth failed — user click required');
+        }
+      }
+      if (GoogleAuth.isSignedIn()) {
         await DriveBackend.pullFromDrive();
         setSyncState('synced');
+      } else {
+        // Silent failed and no prior token. Fall back to Option B: show
+        // the visible authNeeded indicator. Cached data still renders.
+        setSyncState('authNeeded');
       }
     } catch(e) {
       console.warn('[init] Drive boot failed, using cache:', e.message);
