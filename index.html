@@ -778,6 +778,7 @@
     <button class="btn btn-sm" onclick="addPosition()">+ Add Position</button>
     <button class="btn btn-sm" onclick="exportData()" style="margin-right:4px">⬇ Export Data</button>
     <label class="btn btn-sm" style="cursor:pointer;margin-right:4px">⬆ Import Data<input type="file" accept=".json" style="display:none" onchange="importData(this)"></label>
+    <button class="btn btn-sm" onclick="openCSVImport()" style="margin-right:4px" title="Upload a tax-lot CSV from a brokerage">📄 Upload CSV</button>
     <button class="btn btn-sm btn-danger" onclick="clearAll()">Clear All</button>
   </div>
 </div>
@@ -1679,6 +1680,117 @@
       <div class="modal-subtitle" id="wizard-picking-status">Loading the file you picked…</div>
       <div style="display:flex;align-items:center;justify-content:center;padding:20px 0">
         <div style="width:32px;height:32px;border:3px solid var(--color-border-secondary);border-top-color:var(--color-text-info);border-radius:50%;animation:wizard-spin 1s linear infinite"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ─── CSV Import Modal (Phase 8) ─────────────────────────────────────
+     Two-screen modal for uploading tax-lot CSVs from brokerages.
+     Screen A: file upload + column mapping
+     Screen B: preview + confirm import
+-->
+<div class="modal-overlay hidden" id="csv-import-modal">
+  <div class="modal" style="max-width:680px">
+    <!-- ─── CSV Screen A: upload + map ─── -->
+    <div id="csv-screen-upload">
+      <div class="modal-title">Upload tax-lot CSV</div>
+      <div class="modal-subtitle">Import open or closed lots from a brokerage export. Cost basis, sleeve, and theme can be filled in after.</div>
+
+      <!-- File drop / pick zone -->
+      <div id="csv-dropzone" style="border:2px dashed var(--color-border-secondary);border-radius:var(--border-radius);padding:24px;text-align:center;margin:16px 0;cursor:pointer;transition:border-color 0.15s">
+        <div id="csv-dropzone-empty">
+          <div style="font-size:32px;opacity:0.6;margin-bottom:8px">📄</div>
+          <div style="font-family:var(--font-mono);font-size:12px;color:var(--color-text-secondary)">Drag a CSV here, or click to browse</div>
+          <input type="file" id="csv-file-input" accept=".csv,text/csv" style="display:none" onchange="csvOnFileChosen(this.files[0])">
+        </div>
+        <div id="csv-dropzone-loaded" class="hidden">
+          <div style="font-family:var(--font-mono);font-size:11px;color:var(--color-text-info)">
+            <span id="csv-loaded-name"></span> · <span id="csv-loaded-rows"></span>
+          </div>
+          <button class="btn btn-sm" onclick="csvClearFile()" style="margin-top:8px">Choose a different file</button>
+        </div>
+      </div>
+
+      <!-- Mapping section (hidden until file is loaded) -->
+      <div id="csv-mapping-section" class="hidden">
+        <!-- If we recognized this CSV's headers, show a hint -->
+        <div id="csv-recognized-hint" class="hidden wizard-info-block" style="border-color:var(--color-text-success)">
+          <div class="wizard-info-body" style="color:var(--color-text-success);font-size:11px">
+            ✓ Recognized as <strong id="csv-recognized-name"></strong> — mapping pre-filled.
+          </div>
+        </div>
+
+        <!-- Column mapping table -->
+        <div style="margin-top:12px">
+          <div style="font-family:var(--font-mono);font-size:11px;color:var(--color-text-tertiary);margin-bottom:8px">MAP COLUMNS</div>
+          <div id="csv-mapping-rows" style="display:flex;flex-direction:column;gap:6px;font-family:var(--font-mono);font-size:11px"></div>
+        </div>
+
+        <!-- Account assignment -->
+        <div style="margin-top:14px">
+          <div style="font-family:var(--font-mono);font-size:11px;color:var(--color-text-tertiary);margin-bottom:6px">ASSIGN ALL ROWS TO ACCOUNT</div>
+          <input id="csv-account-input" type="text" placeholder="e.g. Brokerage, IRA, 401k" style="width:100%;padding:6px 10px;background:var(--color-background-tertiary);border:1px solid var(--color-border-secondary);border-radius:var(--border-radius);color:var(--color-text-primary);font-family:var(--font-mono);font-size:12px">
+        </div>
+
+        <!-- Date format -->
+        <div style="margin-top:14px;display:flex;align-items:center;gap:10px">
+          <div style="font-family:var(--font-mono);font-size:11px;color:var(--color-text-tertiary)">DATE FORMAT</div>
+          <select id="csv-dateformat-select" style="padding:5px 8px;background:var(--color-background-tertiary);border:1px solid var(--color-border-secondary);border-radius:var(--border-radius);color:var(--color-text-primary);font-family:var(--font-mono);font-size:11px">
+            <option value="M/D/YY">M/D/YY (e.g. 9/26/11)</option>
+            <option value="MM/DD/YYYY">MM/DD/YYYY (e.g. 09/26/2011)</option>
+            <option value="YYYY-MM-DD">YYYY-MM-DD (e.g. 2011-09-26)</option>
+            <option value="D/M/YY">D/M/YY (European)</option>
+          </select>
+          <span id="csv-dateformat-detected" style="font-family:var(--font-mono);font-size:10px;color:var(--color-text-tertiary)"></span>
+        </div>
+
+        <!-- Save mapping option -->
+        <div style="margin-top:14px;padding:10px;background:var(--color-background-tertiary);border-radius:var(--border-radius)">
+          <label style="display:flex;align-items:center;gap:8px;font-family:var(--font-mono);font-size:11px;cursor:pointer">
+            <input type="checkbox" id="csv-save-mapping-checkbox" checked>
+            <span>Save this mapping for next time</span>
+          </label>
+          <input id="csv-mapping-name-input" type="text" placeholder="Mapping name (optional — auto-named if blank)" style="width:100%;margin-top:8px;padding:5px 8px;background:var(--color-background-secondary);border:1px solid var(--color-border-secondary);border-radius:var(--border-radius);color:var(--color-text-primary);font-family:var(--font-mono);font-size:11px">
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button class="btn" onclick="closeCSVImport()">Cancel</button>
+        <button class="btn btn-primary" id="csv-preview-btn" onclick="csvGoToPreview()" disabled>Preview import →</button>
+      </div>
+    </div>
+
+    <!-- ─── CSV Screen B: preview + confirm ─── -->
+    <div id="csv-screen-preview" class="hidden">
+      <div class="modal-title">Review before import</div>
+      <div class="modal-subtitle" id="csv-preview-summary">…</div>
+
+      <!-- Warnings (skipped rows) -->
+      <div id="csv-warnings-block" class="hidden wizard-info-block wizard-info-warn">
+        <div class="wizard-info-body" id="csv-warnings-body" style="font-size:11px;line-height:1.6"></div>
+      </div>
+
+      <!-- Preview table -->
+      <div style="margin-top:12px;max-height:300px;overflow:auto;border:1px solid var(--color-border-secondary);border-radius:var(--border-radius)">
+        <table id="csv-preview-table" style="width:100%;border-collapse:collapse;font-family:var(--font-mono);font-size:11px">
+          <thead style="position:sticky;top:0;background:var(--color-background-tertiary)">
+            <tr>
+              <th style="text-align:left;padding:6px 8px;border-bottom:1px solid var(--color-border-secondary)">Ticker</th>
+              <th style="text-align:left;padding:6px 8px;border-bottom:1px solid var(--color-border-secondary)">Account</th>
+              <th style="text-align:left;padding:6px 8px;border-bottom:1px solid var(--color-border-secondary)">Date Bought</th>
+              <th style="text-align:right;padding:6px 8px;border-bottom:1px solid var(--color-border-secondary)">Shares</th>
+              <th style="text-align:right;padding:6px 8px;border-bottom:1px solid var(--color-border-secondary)">Price Paid</th>
+              <th style="text-align:left;padding:6px 8px;border-bottom:1px solid var(--color-border-secondary)">Status</th>
+            </tr>
+          </thead>
+          <tbody id="csv-preview-tbody"></tbody>
+        </table>
+      </div>
+
+      <div class="modal-actions">
+        <button class="btn" onclick="csvBackToUpload()">← Back</button>
+        <button class="btn btn-primary" id="csv-confirm-btn" onclick="csvConfirmImport()">Import</button>
       </div>
     </div>
   </div>
@@ -9687,6 +9799,575 @@ function clearAll() {
   renderAll();
   scheduleSave();
 }
+
+// ─────────────────────────────────────────────
+// CSV Import — Phase 8
+//
+// Adds an "Upload CSV" path. User uploads a tax-lot CSV from a brokerage,
+// maps columns to tracker fields, previews the result, and imports.
+// Mappings persist in the family-tracker JSON (keyed by header signature)
+// so re-imports from the same source skip the mapping step.
+//
+// Architecture:
+//   CSVParser   — pure parsing, no DOM. Handles quoted fields, embedded
+//                 commas, '--' placeholder normalization, empty separator
+//                 rows (Schwab format quirk), BOM, mixed line endings.
+//   CSVImporter — applies a mapping to parsed rows. Returns {valid,
+//                 skipped, duplicate} buckets and human-readable warnings.
+//   CSVImportUI — modal flow control (file load → map → preview → commit).
+//
+// Out of scope (intentional, called out in the design):
+//   - No update of existing positions; everything is append-as-new-lot.
+//   - No sell-matching against existing opens; sell rows become closed
+//     positions directly.
+//   - No bond / missing-ticker support; those rows are skipped with a
+//     warning surfaced in preview.
+//   - No mapping management UI. Mappings can be re-saved by re-uploading
+//     the same CSV; they cannot be edited or deleted from a UI in v1.
+// ─────────────────────────────────────────────
+
+const CSVParser = (function() {
+  function normalize(text) {
+    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+    return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  }
+
+  function parseRow(line) {
+    const fields = [];
+    let cur = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (inQuotes) {
+        if (c === '"') {
+          if (line[i + 1] === '"') { cur += '"'; i++; }
+          else { inQuotes = false; }
+        } else {
+          cur += c;
+        }
+      } else {
+        if (c === '"') inQuotes = true;
+        else if (c === ',') { fields.push(cur); cur = ''; }
+        else cur += c;
+      }
+    }
+    fields.push(cur);
+    return fields.map(f => f.trim());
+  }
+
+  function isBlankRow(fields) {
+    return fields.every(f => f === '' || f === '--');
+  }
+
+  function parse(text) {
+    if (typeof text !== 'string' || text.length === 0) {
+      return { headers: [], rows: [], rowCount: 0, droppedBlankRows: 0, error: 'empty file' };
+    }
+    const lines = normalize(text).split('\n');
+    let headers = null;
+    const rows = [];
+    let droppedBlankRows = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line === '') { droppedBlankRows++; continue; }
+      const fields = parseRow(line);
+      if (isBlankRow(fields)) { droppedBlankRows++; continue; }
+      if (headers === null) {
+        headers = fields;
+        continue;
+      }
+      const row = {};
+      for (let h = 0; h < headers.length; h++) {
+        row[headers[h]] = fields[h] === undefined ? '' : fields[h];
+      }
+      rows.push(row);
+    }
+    if (headers === null) return { headers: [], rows: [], rowCount: 0, droppedBlankRows, error: 'no headers found' };
+    return { headers, rows, rowCount: rows.length, droppedBlankRows };
+  }
+
+  function headerSignature(headers) {
+    return headers.map(h => h.trim()).join('|');
+  }
+
+  function detectDateFormat(rows, dateColumn) {
+    if (!dateColumn) return null;
+    const samples = rows.slice(0, 20).map(r => r[dateColumn]).filter(v => v && v !== '--').slice(0, 10);
+    if (samples.length === 0) return null;
+    if (samples.every(v => /^\d{4}-\d{1,2}-\d{1,2}$/.test(v))) return 'YYYY-MM-DD';
+    if (samples.every(v => /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(v))) return 'MM/DD/YYYY';
+    if (samples.every(v => /^\d{1,2}\/\d{1,2}\/\d{2}$/.test(v))) return 'M/D/YY';
+    return null;
+  }
+
+  return { parse, headerSignature, detectDateFormat };
+})();
+
+const CSVImporter = (function() {
+  function parseNumber(s) {
+    if (s === null || s === undefined) return null;
+    const cleaned = String(s).replace(/[$,\s]/g, '').trim();
+    if (cleaned === '' || cleaned === '--') return null;
+    const n = parseFloat(cleaned);
+    return isFinite(n) ? n : null;
+  }
+
+  // Two-digit years always become 20YY (locked decision per design doc).
+  function parseDate(s, format) {
+    if (!s || s === '--') return null;
+    const v = String(s).trim();
+    let y, m, d;
+    if (format === 'YYYY-MM-DD') {
+      const m1 = v.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+      if (!m1) return null;
+      y = +m1[1]; m = +m1[2]; d = +m1[3];
+    } else if (format === 'MM/DD/YYYY') {
+      const m1 = v.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+      if (!m1) return null;
+      m = +m1[1]; d = +m1[2]; y = +m1[3];
+    } else if (format === 'M/D/YY') {
+      const m1 = v.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/);
+      if (!m1) return null;
+      m = +m1[1]; d = +m1[2]; y = 2000 + (+m1[3]);
+    } else if (format === 'D/M/YY') {
+      const m1 = v.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/);
+      if (!m1) return null;
+      d = +m1[1]; m = +m1[2]; y = 2000 + (+m1[3]);
+    } else {
+      return null;
+    }
+    if (m < 1 || m > 12 || d < 1 || d > 31) return null;
+    return `${y.toString().padStart(4, '0')}-${m.toString().padStart(2, '0')}-${d.toString().padStart(2, '0')}`;
+  }
+
+  function applyMapping(parsedRows, mapping, existingPositions) {
+    const valid = [];
+    const skipped = [];
+    const duplicate = [];
+    const warnings = [];
+    const f = mapping.fields;
+    if (!f.ticker || !f.dateBought || !f.shares || !f.pricePaid) {
+      return { valid, skipped, duplicate, warnings: ['mapping is incomplete: ticker, date, shares, and price paid are required'] };
+    }
+
+    let bondLikeCount = 0;
+    let missingPriceCount = 0;
+    let invalidDateCount = 0;
+
+    for (let i = 0; i < parsedRows.length; i++) {
+      const row = parsedRows[i];
+      const ticker = (row[f.ticker] || '').trim();
+      const dateRaw = (row[f.dateBought] || '').trim();
+      const sharesRaw = row[f.shares];
+      const priceRaw = row[f.pricePaid];
+
+      if (!ticker || ticker === '--') {
+        bondLikeCount++;
+        skipped.push({ rowIndex: i, sourceRow: row, reason: 'missing ticker (likely bond or special instrument)' });
+        continue;
+      }
+
+      const shares = parseNumber(sharesRaw);
+      const pricePaid = parseNumber(priceRaw);
+      if (shares === null) {
+        skipped.push({ rowIndex: i, sourceRow: row, reason: `invalid shares: "${sharesRaw}"` });
+        continue;
+      }
+      if (pricePaid === null) {
+        missingPriceCount++;
+        skipped.push({ rowIndex: i, sourceRow: row, reason: 'missing or invalid price paid' });
+        continue;
+      }
+
+      const dateBought = parseDate(dateRaw, mapping.dateFormat);
+      if (!dateBought) {
+        invalidDateCount++;
+        skipped.push({ rowIndex: i, sourceRow: row, reason: `unparseable date: "${dateRaw}" (format ${mapping.dateFormat})` });
+        continue;
+      }
+
+      let sellDate = '';
+      let exitPrice = '';
+      let closed = false;
+      if (f.sellDate && row[f.sellDate]) {
+        const sd = parseDate(row[f.sellDate], mapping.dateFormat);
+        if (sd) { sellDate = sd; closed = true; }
+      }
+      if (f.exitPrice && row[f.exitPrice]) {
+        const ep = parseNumber(row[f.exitPrice]);
+        if (ep !== null) exitPrice = String(ep);
+      }
+
+      const candidate = {
+        ticker,
+        account: mapping.account || '',
+        dateBought,
+        shares: String(shares),
+        pricePaid: String(pricePaid),
+        exitPrice,
+        sellDate,
+        spxBuy: '',
+        spxExit: '',
+        closed,
+        notes: '',
+        theme: '',
+        sleeve: '',
+        isETF: false,
+        benchmarkAtBuy: null,
+        benchmarkPriceAtBuy: null,
+        benchmarkPriceAtSell: null
+      };
+
+      const dupe = existingPositions.find(p =>
+        p.ticker === candidate.ticker &&
+        p.account === candidate.account &&
+        p.dateBought === candidate.dateBought &&
+        String(p.shares) === candidate.shares &&
+        String(p.pricePaid) === candidate.pricePaid
+      );
+      if (dupe) {
+        duplicate.push({ rowIndex: i, sourceRow: row, matchingId: dupe.id });
+        continue;
+      }
+
+      valid.push(candidate);
+    }
+
+    if (bondLikeCount > 0) {
+      warnings.push(`${bondLikeCount} row${bondLikeCount === 1 ? '' : 's'} skipped: missing ticker (often bonds or special instruments — not supported).`);
+    }
+    if (missingPriceCount > 0) {
+      warnings.push(`${missingPriceCount} row${missingPriceCount === 1 ? '' : 's'} skipped: missing or invalid price paid.`);
+    }
+    if (invalidDateCount > 0) {
+      warnings.push(`${invalidDateCount} row${invalidDateCount === 1 ? '' : 's'} skipped: unparseable date — try a different date format.`);
+    }
+    if (duplicate.length > 0) {
+      warnings.push(`${duplicate.length} duplicate${duplicate.length === 1 ? '' : 's'} skipped (already in tracker). Note: dedupe matches exact ticker+account+date+shares+price; if you've edited a position since the last import, it may not match.`);
+    }
+    return { valid, skipped, duplicate, warnings };
+  }
+
+  return { applyMapping, _parseNumber: parseNumber, _parseDate: parseDate };
+})();
+
+// ─────────────────────────────────────────────
+// CSV Import UI — modal flow control.
+// ─────────────────────────────────────────────
+
+let _csvState = {
+  fileName: null,
+  parsed: null,
+  mapping: null,
+  result: null,
+  recognizedMapping: null
+};
+
+async function getCsvMappings() {
+  const parsed = await storageGetJSON('csv-mappings');
+  return parsed && Array.isArray(parsed.mappings) ? parsed.mappings : [];
+}
+
+async function saveCsvMappings(mappings) {
+  await storageSetJSON('csv-mappings', { mappings });
+}
+
+async function findMappingByHeaders(headers) {
+  const sig = CSVParser.headerSignature(headers);
+  const all = await getCsvMappings();
+  return all.find(m => m.headerSignature === sig) || null;
+}
+
+async function upsertMapping(newMapping) {
+  const all = await getCsvMappings();
+  const idx = all.findIndex(m => m.headerSignature === newMapping.headerSignature);
+  if (idx >= 0) all[idx] = { ...all[idx], ...newMapping, lastUsed: Date.now() };
+  else all.push({ ...newMapping, id: 'mapping_' + Date.now(), lastUsed: Date.now() });
+  await saveCsvMappings(all);
+}
+
+function openCSVImport() {
+  _csvState = { fileName: null, parsed: null, mapping: null, result: null, recognizedMapping: null };
+  document.getElementById('csv-screen-upload').classList.remove('hidden');
+  document.getElementById('csv-screen-preview').classList.add('hidden');
+  document.getElementById('csv-dropzone-empty').classList.remove('hidden');
+  document.getElementById('csv-dropzone-loaded').classList.add('hidden');
+  document.getElementById('csv-mapping-section').classList.add('hidden');
+  document.getElementById('csv-recognized-hint').classList.add('hidden');
+  document.getElementById('csv-account-input').value = '';
+  document.getElementById('csv-mapping-name-input').value = '';
+  document.getElementById('csv-save-mapping-checkbox').checked = true;
+  document.getElementById('csv-preview-btn').disabled = true;
+  document.getElementById('csv-file-input').value = '';
+  document.getElementById('csv-import-modal').classList.remove('hidden');
+}
+
+function closeCSVImport() {
+  document.getElementById('csv-import-modal').classList.add('hidden');
+}
+
+function csvDropzoneClick() {
+  document.getElementById('csv-file-input').click();
+}
+
+function csvHandleDrop(e) {
+  e.preventDefault();
+  e.currentTarget.style.borderColor = '';
+  const file = e.dataTransfer.files && e.dataTransfer.files[0];
+  if (file) csvOnFileChosen(file);
+}
+
+async function csvOnFileChosen(file) {
+  if (!file) return;
+  if (!/\.csv$/i.test(file.name) && file.type !== 'text/csv') {
+    alert('Please upload a .csv file.');
+    return;
+  }
+  let text;
+  try {
+    text = await file.text();
+  } catch (e) {
+    alert('Could not read file: ' + e.message);
+    return;
+  }
+  const parsed = CSVParser.parse(text);
+  if (parsed.error || parsed.rowCount === 0) {
+    alert('CSV could not be parsed or contains no data rows.\n' + (parsed.error || ''));
+    return;
+  }
+  _csvState.fileName = file.name;
+  _csvState.parsed = parsed;
+
+  document.getElementById('csv-dropzone-empty').classList.add('hidden');
+  document.getElementById('csv-dropzone-loaded').classList.remove('hidden');
+  document.getElementById('csv-loaded-name').textContent = file.name;
+  document.getElementById('csv-loaded-rows').textContent = `${parsed.rowCount} row${parsed.rowCount === 1 ? '' : 's'}`;
+  document.getElementById('csv-mapping-section').classList.remove('hidden');
+
+  let recognized = null;
+  try { recognized = await findMappingByHeaders(parsed.headers); } catch(e) { console.warn('[csv] mapping lookup failed', e); }
+  _csvState.recognizedMapping = recognized;
+
+  if (recognized) {
+    document.getElementById('csv-recognized-hint').classList.remove('hidden');
+    document.getElementById('csv-recognized-name').textContent = recognized.name || '(saved mapping)';
+    document.getElementById('csv-mapping-name-input').value = recognized.name || '';
+  } else {
+    document.getElementById('csv-recognized-hint').classList.add('hidden');
+  }
+
+  renderCsvMappingRows();
+
+  let dateCol = recognized && recognized.fields && recognized.fields.dateBought;
+  if (!dateCol) {
+    dateCol = parsed.headers.find(h => /acqui|date.*bought|bought.*date/i.test(h))
+           || parsed.headers.find(h => /date/i.test(h));
+  }
+  const detected = CSVParser.detectDateFormat(parsed.rows, dateCol);
+  if (detected) {
+    document.getElementById('csv-dateformat-select').value = detected;
+    document.getElementById('csv-dateformat-detected').textContent = `(detected from data)`;
+  } else {
+    document.getElementById('csv-dateformat-detected').textContent = '';
+  }
+
+  validateCsvForm();
+}
+
+function csvClearFile() {
+  _csvState = { fileName: null, parsed: null, mapping: null, result: null, recognizedMapping: null };
+  document.getElementById('csv-dropzone-empty').classList.remove('hidden');
+  document.getElementById('csv-dropzone-loaded').classList.add('hidden');
+  document.getElementById('csv-mapping-section').classList.add('hidden');
+  document.getElementById('csv-file-input').value = '';
+  document.getElementById('csv-preview-btn').disabled = true;
+}
+
+function renderCsvMappingRows() {
+  const headers = _csvState.parsed.headers;
+  const recognized = _csvState.recognizedMapping;
+  const targets = [
+    { key: 'ticker',     label: 'Ticker *',       guess: ['symbol', 'ticker'] },
+    { key: 'dateBought', label: 'Date Bought *',  guess: ['acquisition date', 'buy date', 'date bought', 'date'] },
+    { key: 'shares',     label: 'Shares *',       guess: ['quantity', 'shares', 'qty'] },
+    { key: 'pricePaid',  label: 'Price Paid *',   guess: ['unit cost', 'cost basis per share', 'price paid', 'price'] },
+    { key: 'sellDate',   label: 'Sell Date',      guess: ['sell date', 'sale date', 'closed date'] },
+    { key: 'exitPrice',  label: 'Exit Price',     guess: ['sell price', 'exit price'] }
+  ];
+  const container = document.getElementById('csv-mapping-rows');
+  container.innerHTML = '';
+  for (const t of targets) {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:8px';
+    const label = document.createElement('div');
+    label.style.cssText = 'flex:0 0 110px;color:var(--color-text-secondary)';
+    label.textContent = t.label;
+    const select = document.createElement('select');
+    select.id = `csv-map-${t.key}`;
+    select.style.cssText = 'flex:1;padding:5px 8px;background:var(--color-background-tertiary);border:1px solid var(--color-border-secondary);border-radius:var(--border-radius);color:var(--color-text-primary);font-family:var(--font-mono);font-size:11px';
+    select.onchange = validateCsvForm;
+    const blank = document.createElement('option');
+    blank.value = ''; blank.textContent = (t.key === 'sellDate' || t.key === 'exitPrice') ? '— not in CSV —' : '— pick a column —';
+    select.appendChild(blank);
+    for (const h of headers) {
+      const opt = document.createElement('option');
+      opt.value = h; opt.textContent = h;
+      select.appendChild(opt);
+    }
+    let preset = '';
+    if (recognized && recognized.fields && recognized.fields[t.key]) {
+      preset = recognized.fields[t.key];
+    } else {
+      const lc = headers.map(h => h.toLowerCase());
+      for (const g of t.guess) {
+        const idx = lc.findIndex(h => h.includes(g));
+        if (idx >= 0) { preset = headers[idx]; break; }
+      }
+    }
+    if (preset && headers.includes(preset)) select.value = preset;
+    row.appendChild(label);
+    row.appendChild(select);
+    container.appendChild(row);
+  }
+}
+
+function validateCsvForm() {
+  if (!_csvState.parsed) {
+    document.getElementById('csv-preview-btn').disabled = true;
+    return;
+  }
+  const required = ['ticker', 'dateBought', 'shares', 'pricePaid'];
+  const allMapped = required.every(k => {
+    const sel = document.getElementById(`csv-map-${k}`);
+    return sel && sel.value;
+  });
+  const account = document.getElementById('csv-account-input').value.trim();
+  document.getElementById('csv-preview-btn').disabled = !(allMapped && account);
+}
+
+function csvGoToPreview() {
+  if (!_csvState.parsed) return;
+  const fields = {};
+  ['ticker', 'dateBought', 'shares', 'pricePaid', 'sellDate', 'exitPrice'].forEach(k => {
+    const sel = document.getElementById(`csv-map-${k}`);
+    fields[k] = sel ? sel.value || null : null;
+  });
+  const mapping = {
+    fields,
+    account: document.getElementById('csv-account-input').value.trim(),
+    dateFormat: document.getElementById('csv-dateformat-select').value
+  };
+  _csvState.mapping = mapping;
+
+  const result = CSVImporter.applyMapping(_csvState.parsed.rows, mapping, positions);
+  _csvState.result = result;
+
+  document.getElementById('csv-screen-upload').classList.add('hidden');
+  document.getElementById('csv-screen-preview').classList.remove('hidden');
+
+  const total = _csvState.parsed.rowCount;
+  const ok = result.valid.length;
+  const skipped = result.skipped.length;
+  const dupes = result.duplicate.length;
+  document.getElementById('csv-preview-summary').textContent =
+    `${ok} row${ok === 1 ? '' : 's'} ready to import · ${skipped} skipped · ${dupes} duplicate${dupes === 1 ? '' : 's'} (of ${total} total)`;
+
+  const wblock = document.getElementById('csv-warnings-block');
+  const wbody = document.getElementById('csv-warnings-body');
+  if (result.warnings.length > 0) {
+    wblock.classList.remove('hidden');
+    wbody.innerHTML = result.warnings.map(w => '• ' + w).join('<br>');
+  } else {
+    wblock.classList.add('hidden');
+  }
+
+  const tbody = document.getElementById('csv-preview-tbody');
+  tbody.innerHTML = '';
+  const MAX_PREVIEW = 50;
+  const slice = result.valid.slice(0, MAX_PREVIEW);
+  for (const p of slice) {
+    const tr = document.createElement('tr');
+    tr.style.borderBottom = '1px solid var(--color-border-secondary)';
+    const status = p.closed ? '<span style="color:var(--color-text-tertiary)">closed</span>' : '<span style="color:var(--color-text-success)">open</span>';
+    tr.innerHTML = `
+      <td style="padding:5px 8px">${p.ticker}</td>
+      <td style="padding:5px 8px">${p.account}</td>
+      <td style="padding:5px 8px">${p.dateBought}</td>
+      <td style="padding:5px 8px;text-align:right">${p.shares}</td>
+      <td style="padding:5px 8px;text-align:right">${p.pricePaid}</td>
+      <td style="padding:5px 8px">${status}</td>`;
+    tbody.appendChild(tr);
+  }
+  if (result.valid.length > MAX_PREVIEW) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td colspan="6" style="padding:8px;text-align:center;color:var(--color-text-tertiary);font-style:italic">…and ${result.valid.length - MAX_PREVIEW} more</td>`;
+    tbody.appendChild(tr);
+  }
+
+  document.getElementById('csv-confirm-btn').disabled = result.valid.length === 0;
+}
+
+function csvBackToUpload() {
+  document.getElementById('csv-screen-preview').classList.add('hidden');
+  document.getElementById('csv-screen-upload').classList.remove('hidden');
+}
+
+async function csvConfirmImport() {
+  if (!_csvState.result || _csvState.result.valid.length === 0) return;
+  const btn = document.getElementById('csv-confirm-btn');
+  btn.disabled = true;
+  btn.textContent = 'Importing…';
+
+  try {
+    for (const candidate of _csvState.result.valid) {
+      const pos = { id: nextId++, ...candidate };
+      positions.push(pos);
+    }
+    await savePositions();
+
+    if (document.getElementById('csv-save-mapping-checkbox').checked) {
+      const sig = CSVParser.headerSignature(_csvState.parsed.headers);
+      const userName = document.getElementById('csv-mapping-name-input').value.trim();
+      const autoName = `Mapping for ${_csvState.fileName} (${new Date().toLocaleDateString()})`;
+      try {
+        await upsertMapping({
+          headerSignature: sig,
+          name: userName || autoName,
+          fields: _csvState.mapping.fields,
+          dateFormat: _csvState.mapping.dateFormat
+        });
+      } catch(e) {
+        console.warn('[csv] failed to save mapping (data still imported):', e);
+      }
+    }
+
+    closeCSVImport();
+    renderAll();
+    const note = document.getElementById('save-note-inline');
+    if (note) {
+      const oldText = note.textContent;
+      note.textContent = `Imported ${_csvState.result.valid.length} positions`;
+      note.style.opacity = '1';
+      setTimeout(() => { note.style.opacity = '0'; setTimeout(() => { note.textContent = oldText; }, 300); }, 3000);
+    }
+  } catch(e) {
+    console.error('[csv] import failed:', e);
+    alert('Import failed: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'Import';
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  const dz = document.getElementById('csv-dropzone');
+  if (!dz) return;
+  dz.addEventListener('click', csvDropzoneClick);
+  dz.addEventListener('dragover', (e) => { e.preventDefault(); dz.style.borderColor = 'var(--color-text-info)'; });
+  dz.addEventListener('dragleave', () => { dz.style.borderColor = ''; });
+  dz.addEventListener('drop', csvHandleDrop);
+  const acct = document.getElementById('csv-account-input');
+  if (acct) acct.addEventListener('input', validateCsvForm);
+});
 
 // ─────────────────────────────────────────────
 // Boot
