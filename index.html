@@ -6888,7 +6888,9 @@ function sumDividendsInRange(dividends, splits, startDate, endDate, shares) {
 //   1 = original — Polygon's cash_amount used as-is (no split adjustment). WRONG for any ticker that has split.
 //   2 = added cumulative split adjustment from /v3/reference/splits.
 //   3 = added spinoff filter — skip splits with from/to > 100 (Polygon represents spinoffs as splits).
-const DIVIDENDS_FORMULA_VERSION = 3;
+//   4 = stricter fetchOk: now requires BOTH dividends AND splits to succeed; v3 lots whose splits
+//       silently 429'd were stored with fetchOk=true but missing adjustments. Bump forces re-fetch.
+const DIVIDENDS_FORMULA_VERSION = 4;
 
 async function backfillDividends() {
   const status = document.getElementById('backfill-divs-status');
@@ -7034,9 +7036,17 @@ async function backfillDividends() {
         failed.push({ ticker, id: lot.id, reason: `divs: ${divResult.error}` });
       }
     } else {
-      const splitsForLot = splitResult.error ? [] : (splitResult.splits || []);
-      if (splitResult.error) {
-        console.warn(`[backfillDividends] ${ticker} splits fetch failed: ${splitResult.error}. Proceeding without split adjustment.`);
+      // Dividends succeeded. But splits may have failed independently — if
+      // they did, we have ambiguity: empty splits could mean "no splits ever"
+      // (legitimate, no adjustment needed) OR "splits fetch failed" (we'd be
+      // missing real adjustments). Without splits we can't tell. Solution:
+      // if splits errored, mark fetchOk=false so the next backfill prioritizes
+      // re-fetching this ticker. We still write the dividend numbers — partial
+      // data is better than none — but they're flagged for retry.
+      const splitsErrored = !!splitResult.error;
+      const splitsForLot = splitsErrored ? [] : (splitResult.splits || []);
+      if (splitsErrored) {
+        console.warn(`[backfillDividends] ${ticker} splits fetch failed: ${splitResult.error}. Storing dividends without split adjustment; will retry on next backfill.`);
       }
       for (const lot of lots) {
         const shares = parseFloat(lot.shares) || 0;
@@ -7045,9 +7055,16 @@ async function backfillDividends() {
         lot.dividendsCollected = sum.total;
         lot.dividendsCount = sum.count;
         lot.dividendsLastFetch = nowIso;
-        lot.dividendsFetchOk = true;
+        // If splits failed, the math is unreliable — flag as not-ok so this
+        // ticker gets prioritized on the next click. If splits succeeded
+        // (including empty=no-splits-ever, which is fine), flag as ok.
+        lot.dividendsFetchOk = !splitsErrored;
         lot.dividendsFormulaVersion = DIVIDENDS_FORMULA_VERSION;
         lotsUpdated++;
+        if (splitsErrored) {
+          // Add to failed list so the user sees "X failed, click again" message.
+          failed.push({ ticker, id: lot.id, reason: `splits: ${splitResult.error}` });
+        }
       }
     }
 
