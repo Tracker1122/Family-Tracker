@@ -132,6 +132,14 @@
     border-radius: var(--border-radius-md);
     padding: 10px 12px;
   }
+  .summary-card-clickable {
+    cursor: pointer;
+    transition: border-color 120ms ease, background 120ms ease;
+  }
+  .summary-card-clickable:hover {
+    border-color: var(--color-border-secondary);
+    background: var(--color-background-tertiary);
+  }
   .summary-card-label {
     font-size: 9px; text-transform: uppercase; letter-spacing: 0.1em;
     color: var(--color-text-tertiary); margin-bottom: 4px;
@@ -1208,6 +1216,7 @@
             <th class="r">Your Ret %</th>
             <th class="r">S&P Ret %</th>
             <th class="r">vs S&P (pp)</th>
+            <th class="r" title="TR vs S&P TR — your Total Return % minus S&P 500 Total Return % over this lot's hold period (buy → sell). Includes dividends on both sides. Lots without div backfill count divs as $0, under-stating this number. Small line below shows the dollar version.">TR vs S&P TR</th>
             <th class="r" title="Theme-relative alpha — your return minus theme benchmark return over the holding period (buy date to sell date).">Theme α (pp)</th>
             <th>Result</th>
             <th>Status</th>
@@ -1263,6 +1272,7 @@
             <th onclick="sortRebal('portfolioPct')" class="sortable r">Managed % <span id="sort-portfolioPct"></span></th>
             <th class="r">Industry %</th>
             <th onclick="sortRebal('dollarAlpha')" class="sortable r">Dollar Alpha <span id="sort-dollarAlpha"></span></th>
+            <th onclick="sortRebal('trAlpha')" class="sortable r" title="Dollar TR alpha — includes dividends on both sides (yours + S&amp;P TR). Lots without div backfill count divs as $0, under-stating this number.">TR α <span id="sort-trAlpha"></span></th>
             <th onclick="sortRebal('themeAlpha')" class="sortable r" title="Theme-relative alpha — your dollar gain vs theme benchmark over the same period. More honest comparison for sleeves with assigned theme benchmarks.">Theme α <span id="sort-themeAlpha"></span></th>
             <th onclick="sortRebal('gl')" class="sortable r">Unreal. G/L <span id="sort-gl"></span></th>
             <th>Signal</th>
@@ -5499,7 +5509,161 @@ function calcPortfolioTrSummary(posArr) {
 }
 
 // ─────────────────────────────────────────────
-// Listing-date check helpers (Batch 3)
+// Dollar TR alpha helpers (Batch 4 Phase 2)
+//
+// "TR alpha" = your dollar gain INCLUDING DIVIDENDS minus what the same
+// capital would have produced in S&P 500 TOTAL RETURN (price + reinvested
+// dividends) over the same hold period. It's the dividend-honest version
+// of the existing $ Alpha column, which is price-only on both sides.
+//
+// Math (Definition X — dollars, not percent):
+//   yourValueWithDivs = invested + totalGainLoss   // price gain + divs
+//   spxValueWithTr    = invested × (1 + spxTrReturnPct/100)
+//   trAlpha           = yourValueWithDivs - spxValueWithTr
+//                     = totalGainLoss - invested × (spxTrReturnPct/100)
+//
+// All inputs come from calcPositionDrilldown — no new period math, no new
+// SPX lookups, no new dividend math. The existing drilldown already does
+// the work; we just subtract the right two numbers.
+//
+// Coverage handling (per spec choice 2c):
+// - Lots without successful div backfill: divs count as $0 → TR alpha is
+//   under-stated (less negative than reality, since most stocks pay divs).
+//   Caller surfaces "X/Y missing divs" footnote.
+// - Lots without SPX TR data (buy date outside snapshot range, very rare):
+//   excluded entirely from the row aggregate. If ALL lots in a row have
+//   missing SPX TR, row alpha returns null.
+// ─────────────────────────────────────────────
+
+// Per-lot. Takes a calcPositionDrilldown(pos) RESULT (not pos itself), so
+// callers that already have the drilldown don't pay to recompute it.
+// Returns null if the lot can't contribute (missing prices or missing SPX TR).
+function calcLotTrAlphaDollars(d) {
+  if (!d) return null;
+  if (d.totalGainLoss === null || d.totalGainLoss === undefined) return null;
+  if (d.invested === null || d.invested === undefined || d.invested <= 0) return null;
+  if (d.spxTrReturnPct === null || d.spxTrReturnPct === undefined) return null;
+  const spxDollarReturn = d.invested * (d.spxTrReturnPct / 100);
+  return d.totalGainLoss - spxDollarReturn;
+}
+
+// Row-level / per-ticker. Sums per-lot TR alpha across an array of lots
+// (typically all open lots of one ticker, or one ticker+account combo).
+//
+// Returns:
+//   trAlpha           — dollar TR alpha summed across contributing lots, or null
+//   lotsTotal         — count of lots passed in
+//   lotsContributing  — count of lots that produced a non-null per-lot TR alpha
+//   lotsMissingDivs   — count of lots without successful div backfill (TR understated)
+//   lotsMissingSpxTr  — count of lots without SPX TR data (excluded from sum)
+//   coverage          — 'full' | 'partial' | 'none' (matches calcPortfolioTrSummary convention)
+//
+// "Coverage" reflects DIVIDEND coverage specifically — the visible UI concern.
+// SPX TR misses are extremely rare (buy dates within the 1988→present range
+// always resolve) and surface in lotsMissingSpxTr if needed.
+function aggregateRowTrAlpha(lots) {
+  const out = {
+    trAlpha: null,
+    lotsTotal: Array.isArray(lots) ? lots.length : 0,
+    lotsContributing: 0,
+    lotsMissingDivs: 0,
+    lotsMissingSpxTr: 0,
+    coverage: 'none'
+  };
+  if (!Array.isArray(lots) || lots.length === 0) return out;
+
+  let sum = 0;
+  let lotsWithDivs = 0;
+
+  lots.forEach(function(p){
+    const d = calcPositionDrilldown(p);
+    if (d.divsFetched) lotsWithDivs++;
+    else out.lotsMissingDivs++;
+    const a = calcLotTrAlphaDollars(d);
+    if (a === null) {
+      // Why null? Distinguish missing-SPX-TR from missing-prices for the caller.
+      if (d.spxTrReturnPct === null && d.totalGainLoss !== null && d.invested && d.invested > 0) {
+        out.lotsMissingSpxTr++;
+      }
+      return;
+    }
+    sum += a;
+    out.lotsContributing++;
+  });
+
+  if (out.lotsContributing > 0) out.trAlpha = sum;
+
+  // Coverage classification — by dividend status, matching calcPortfolioTrSummary.
+  if (out.lotsTotal === 0) out.coverage = 'none';
+  else if (out.lotsMissingDivs === 0) out.coverage = 'full';
+  else if (lotsWithDivs === 0) out.coverage = 'none';
+  else out.coverage = 'partial';
+
+  return out;
+}
+
+// Portfolio-level. Used by the strip card "Dollar TR Alpha" sibling (Phase 3).
+// Same shape as aggregateRowTrAlpha but takes any array of positions.
+// (Behaviorally identical — kept as a separate name for caller readability.)
+function calcDollarTrAlphaForPortfolio(posArr) {
+  return aggregateRowTrAlpha(posArr);
+}
+
+// Percentage-points version of aggregateRowTrAlpha (Batch 4 Phase 6).
+//
+// Returns the cost-basis-weighted gap between your TR % and S&P TR % across
+// the lots in `lots`. Used by the Closed Positions table (and any other
+// surface where the existing pattern is percentage-based, like vs S&P (pp)).
+//
+// Math: cost-basis-weighted average of d.gapVsSpxTr (which is per-lot
+// totalReturnPct − spxTrReturnPct, already pre-computed in calcPositionDrilldown).
+// Same convention as calcSummary's weightedSpx and calcPortfolioTrSummary.
+//
+// Returns:
+//   trAlphaPp         — pp gap, weighted by cost basis (null if no contributors)
+//   lotsTotal         — count passed in
+//   lotsContributing  — count with both totalReturnPct and spxTrReturnPct
+//   lotsMissingDivs   — count without successful div backfill (under-states)
+//   coverage          — 'full' | 'partial' | 'none' (matches dollar version)
+//
+// Same coverage caveat as the dollar version: lots without div backfill
+// contribute price gain only, so trAlphaPp is under-stated.
+function aggregateRowTrAlphaPct(lots) {
+  const out = {
+    trAlphaPp: null,
+    lotsTotal: Array.isArray(lots) ? lots.length : 0,
+    lotsContributing: 0,
+    lotsMissingDivs: 0,
+    coverage: 'none'
+  };
+  if (!Array.isArray(lots) || lots.length === 0) return out;
+
+  let weightedSum = 0;
+  let weightDen = 0;
+  let lotsWithDivs = 0;
+
+  lots.forEach(function(p){
+    const d = calcPositionDrilldown(p);
+    if (d.divsFetched) lotsWithDivs++;
+    else out.lotsMissingDivs++;
+    if (d.gapVsSpxTr !== null && d.gapVsSpxTr !== undefined && d.invested && d.invested > 0) {
+      weightedSum += d.gapVsSpxTr * d.invested;
+      weightDen += d.invested;
+      out.lotsContributing++;
+    }
+  });
+
+  if (weightDen > 0) out.trAlphaPp = weightedSum / weightDen;
+
+  if (out.lotsTotal === 0) out.coverage = 'none';
+  else if (out.lotsMissingDivs === 0) out.coverage = 'full';
+  else if (lotsWithDivs === 0) out.coverage = 'none';
+  else out.coverage = 'partial';
+
+  return out;
+}
+
+
 //
 // evaluateListingDate(pos): pure function — returns the appropriate
 // listingDateCheck value given a position's dateBought and listingDate.
@@ -5804,6 +5968,89 @@ function _runDrilldownTests() {
       && fresh.listingDateOverride === false,
       'Test 20: mkPos sets listing-date defaults');
 
+  // ─── Batch 4 Phase 2: dollar TR alpha helpers ───
+  // Test 21: per-lot TR alpha — clean winner
+  log(approx(calcLotTrAlphaDollars({
+        invested: 1000, totalGainLoss: 300, spxTrReturnPct: 20, divsFetched: true
+      }), 100),
+      'Test 21: per-lot TR alpha (clean winner) = +$100');
+
+  // Test 22: per-lot TR alpha — null when SPX TR missing
+  log(calcLotTrAlphaDollars({
+        invested: 1000, totalGainLoss: 300, spxTrReturnPct: null, divsFetched: true
+      }) === null,
+      'Test 22: per-lot TR alpha returns null without SPX TR data');
+
+  // Test 23: per-lot TR alpha — defensive nulls
+  log(calcLotTrAlphaDollars(null) === null
+      && calcLotTrAlphaDollars(undefined) === null
+      && calcLotTrAlphaDollars({ invested: 0 }) === null,
+      'Test 23: per-lot TR alpha — defensive null/zero handling');
+
+  // Test 24: row aggregate — sum across 3 lots
+  // Lots aren't real positions, so we run aggregateRowTrAlpha on synthetic
+  // pos objects. calcPositionDrilldown will see them as plain objects and
+  // pull whatever fields it needs; the helpers don't care about pos shape
+  // beyond what flows through to the drilldown result. To test the row
+  // aggregator without polluting `positions`, save & restore.
+  const savedPositionsB4 = positions;
+  positions = [
+    { id: 8001, ticker: 'TST', shares: 10, pricePaid: 100, exitPrice: 130,
+      dateBought: '2023-06-01', closed: false,
+      spxBuy: 4200, spxExit: 5800,
+      dividendsFetchOk: true, dividendsCollected: 0 },
+    { id: 8002, ticker: 'TST', shares: 5, pricePaid: 200, exitPrice: 220,
+      dateBought: '2023-06-01', closed: false,
+      spxBuy: 4200, spxExit: 5800,
+      dividendsFetchOk: true, dividendsCollected: 0 }
+  ];
+  // For these lots calcPositionDrilldown will pull spxTrReturnPct from
+  // the SPX TR snapshot for 2023-06-01 → today; we don't know the exact
+  // value, but the row aggregate should return a number, contribute both
+  // lots, and report full coverage.
+  const rowAgg = aggregateRowTrAlpha(positions);
+  log(rowAgg.lotsTotal === 2 && rowAgg.lotsContributing === 2,
+      'Test 24: row aggregate counts both lots');
+  log(rowAgg.coverage === 'full',
+      'Test 24: row coverage = full (both div-fetched)');
+  log(rowAgg.trAlpha !== null && typeof rowAgg.trAlpha === 'number',
+      'Test 24: row trAlpha is a number');
+  positions = savedPositionsB4;
+
+  // Test 25: portfolio helper is the same as row helper (alias check)
+  // calcDollarTrAlphaForPortfolio is defined as a thin pass-through.
+  log(typeof calcDollarTrAlphaForPortfolio === 'function',
+      'Test 25: calcDollarTrAlphaForPortfolio defined');
+  const empty = calcDollarTrAlphaForPortfolio([]);
+  log(empty.trAlpha === null && empty.lotsTotal === 0 && empty.coverage === 'none',
+      'Test 25: empty portfolio → null + coverage=none');
+
+  // ─── Batch 4 Phase 6: percentage-points TR alpha helper ───
+  // Test 26: aggregateRowTrAlphaPct defined + empty array safe
+  log(typeof aggregateRowTrAlphaPct === 'function',
+      'Test 26: aggregateRowTrAlphaPct defined');
+  const emptyPp = aggregateRowTrAlphaPct([]);
+  log(emptyPp.trAlphaPp === null && emptyPp.lotsTotal === 0 && emptyPp.coverage === 'none',
+      'Test 26: empty array → null + coverage=none');
+
+  // Test 27: percentage helper uses gapVsSpxTr from drilldown — wire-up check
+  // Use a synthetic position via positions array swap, like Test 24.
+  const savedPositionsP6 = positions;
+  positions = [
+    { id: 8101, ticker: 'TST', shares: 10, pricePaid: 100, exitPrice: 150,
+      dateBought: '2023-06-01', closed: false,
+      spxBuy: 4200, spxExit: 5800,
+      dividendsFetchOk: true, dividendsCollected: 50 }
+  ];
+  const ppAgg = aggregateRowTrAlphaPct(positions);
+  log(ppAgg.lotsTotal === 1 && ppAgg.lotsContributing === 1,
+      'Test 27: counts contributing lot');
+  log(ppAgg.coverage === 'full',
+      'Test 27: full coverage when div-fetched');
+  log(typeof ppAgg.trAlphaPp === 'number',
+      'Test 27: trAlphaPp resolves to a number');
+  positions = savedPositionsP6;
+
   console.log('%cDrilldown test suite complete.', 'color:#94a3b8;font-style:italic');
 }
 
@@ -5855,12 +6102,25 @@ function renderSummary(containerId, posArr, isOpen) {
     ? `<div style="font-size:8px;color:#fbbf24;font-style:italic;margin-top:2px" title="No lots have been div-backfilled. Click ⟳ Backfill Dividends in the header.">divs not backfilled</div>`
     : '';
 
+  // Dollar TR Alpha (Batch 4 Phase 3) — sibling to Dollar Alpha, but using
+  // total return (price + divs) on both sides instead of price-only.
+  // Same coverage semantics as the TR % cards: under-states when divs are
+  // missing on some lots.
+  const trDollarAlpha = isOpen ? calcDollarTrAlphaForPortfolio(posArr) : null;
+  const trDollarAlphaCoverageNote = trDollarAlpha && trDollarAlpha.coverage === 'partial'
+    ? `<div style="font-size:8px;color:#fbbf24;font-style:italic;margin-top:2px" title="${trDollarAlpha.lotsMissingDivs} of ${trDollarAlpha.lotsTotal} lots haven't been div-backfilled. Their dividends count as $0, so this number under-states your TR alpha.">${trDollarAlpha.lotsMissingDivs}/${trDollarAlpha.lotsTotal} missing divs</div>`
+    : trDollarAlpha && trDollarAlpha.coverage === 'none' && trDollarAlpha.lotsTotal > 0
+    ? `<div style="font-size:8px;color:#fbbf24;font-style:italic;margin-top:2px" title="No lots have been div-backfilled. Click ⟳ Backfill Dividends in the header.">divs not backfilled</div>`
+    : '';
+
   // Listing-date flagged-lots note (Batch 3) — only shown on open-positions
   // strip. Cards still compute including flagged lots; this is informational.
-  // Click the ⓘ on any row to see the per-lot warning in the modal.
+  // Batch 4: hover tooltip removed — full explanation lives in the click-modal
+  // on the TR vs S&P TR card itself. Wording updated: "click card for details"
+  // (whole card is clickable, not just this line, but click anywhere works).
   const flaggedCount = isOpen ? countFlaggedLots(posArr) : 0;
   const flaggedNote = flaggedCount > 0
-    ? `<div style="font-size:8px;color:#fbbf24;font-style:italic;margin-top:2px" title="${flaggedCount} lot${flaggedCount===1?'':'s'} have a buy date that predates the ticker's actual listing (typically spinoff cost-basis allocations). Their returns vs the S&amp;P over that 'hold period' are not meaningful. Open the per-lot drilldown (ⓘ) on any row to see details.">${flaggedCount} lot${flaggedCount===1?'':'s'} flagged — see modal for details</div>`
+    ? `<div style="font-size:8px;color:#fbbf24;font-style:italic;margin-top:2px">${flaggedCount} lot${flaggedCount===1?'':'s'} flagged — click card for details</div>`
     : '';
 
   el.innerHTML = `
@@ -5892,6 +6152,11 @@ function renderSummary(containerId, posArr, isOpen) {
       <div class="summary-card-label">Dollar Alpha</div>
       <div class="summary-card-value ${s.dollarAlpha >= 0 ? 'success' : 'danger'}">${fmtDollarWhole(s.dollarAlpha)}${fmtAlphaPct(s.dollarAlpha, s.totalInvested)}</div>
     </div>` : ''}
+    ${isOpen ? `<div class="summary-card" title="Dollar TR Alpha = your dollar gain (price + dividends) minus what S&P 500 Total Return would have produced on the same capital over the same hold period. The dividend-honest version of Dollar Alpha. Lots without div backfill count divs as $0, under-stating this number.">
+      <div class="summary-card-label">Dollar TR Alpha</div>
+      <div class="summary-card-value ${trDollarAlpha && trDollarAlpha.trAlpha !== null ? (trDollarAlpha.trAlpha >= 0 ? 'success' : 'danger') : ''}">${trDollarAlpha && trDollarAlpha.trAlpha !== null ? fmtDollarWhole(trDollarAlpha.trAlpha) + fmtAlphaPct(trDollarAlpha.trAlpha, s.totalInvested) : '—'}</div>
+      ${trDollarAlphaCoverageNote}
+    </div>` : ''}
     ${isOpen ? `<div class="summary-card" title="Your Total Return % = (price gain + dividends collected) / invested, weighted by cost basis. Dividends require backfill — uncovered lots contribute price gain only.">
       <div class="summary-card-label">Your TR %</div>
       <div class="summary-card-value ${colorClass(tr.yourTrPct)}">${fmtPct(tr.yourTrPct)}</div>
@@ -5901,7 +6166,7 @@ function renderSummary(containerId, posArr, isOpen) {
       <div class="summary-card-label">S&P TR %</div>
       <div class="summary-card-value ${colorClass(tr.spxTrPct)}">${fmtPct(tr.spxTrPct)}</div>
     </div>` : ''}
-    ${isOpen ? `<div class="summary-card" title="Your Total Return minus S&P Total Return. Positive = you beat the index after dividends on both sides.">
+    ${isOpen ? `<div class="summary-card summary-card-clickable" onclick="openTrCardExplainer()">
       <div class="summary-card-label">TR vs S&P TR</div>
       <div class="summary-card-value ${colorClass(tr.gapTrPp)}">${fmtPp(tr.gapTrPp)}</div>
       ${flaggedNote}
@@ -6301,6 +6566,32 @@ function renderClosedRow(pos) {
     <td class="calc-cell ${spxRetClass}">${c.spxReturn !== null ? fmtPct(c.spxReturn) : '<span class="dash">—</span>'}</td>
     <td class="calc-cell ${vsClass}">${c.vsSpx !== null ? fmtPp(c.vsSpx) : '<span class="dash">—</span>'}</td>
     <td class="calc-cell">${(() => {
+      // TR vs S&P TR — pp gap with dollar version inline (Batch 4 Phase 6)
+      // Closed-row table renders one lot per row, but aggregateRow* helpers
+      // are designed for arrays. Wrapping a single pos in [] is correct and
+      // gives us the same coverage handling as multi-lot rows for free.
+      const trPp = aggregateRowTrAlphaPct([pos]);
+      const trDol = aggregateRowTrAlpha([pos]);
+      if (trPp.trAlphaPp === null && trDol.trAlpha === null) {
+        return '<span class="dash">—</span>';
+      }
+      const ppCls = trPp.trAlphaPp === null ? '' : colorClass(trPp.trAlphaPp);
+      const dolCls = trDol.trAlpha === null ? 'var(--color-text-tertiary)'
+        : trDol.trAlpha >= 0 ? 'var(--color-text-success)' : 'var(--color-text-danger)';
+      const ppLine = trPp.trAlphaPp !== null
+        ? `<span class="${ppCls}">${fmtPp(trPp.trAlphaPp)}</span>`
+        : '<span class="dash">—</span>';
+      const dolLine = trDol.trAlpha !== null
+        ? `<div style="font-size:9px;color:${dolCls};margin-top:1px;font-weight:400">${fmtDollarWhole(trDol.trAlpha)}</div>`
+        : '';
+      // Coverage footnote — appears when this lot's divs aren't backfilled.
+      // Wording is single-lot-aware: "no divs" rather than "X/Y no divs".
+      const coverageFootnote = trPp.coverage === 'partial' || trPp.coverage === 'none'
+        ? `<div style="font-size:8px;color:#fbbf24;font-style:italic;font-weight:400" title="This lot isn't div-backfilled. TR alpha is under-stated.">no divs</div>`
+        : '';
+      return ppLine + dolLine + coverageFootnote;
+    })()}</td>
+    <td class="calc-cell">${(() => {
       const ta = calcThemeAlpha(pos);
       if (!ta) return '<span class="dash">—</span>';
       const cls = colorClass(ta.themeAlphaPct);
@@ -6484,6 +6775,12 @@ function renderTrimWatch() {
     const allLT = tranches.every(d => d.isLT);
     const allST = tranches.every(d => !d.isLT && !d.isIRA);
 
+    // TR alpha (Batch 4 Phase 4) — dividend-honest sibling of $ Alpha.
+    // Sums per-lot TR alpha across this row's lots. Returns coverage info
+    // for the partial-divs footnote.
+    const trAgg = aggregateRowTrAlpha(tranches.map(d => d.p));
+    const totalTrAlpha = trAgg.trAlpha; // null if no lot can contribute
+
     // Total dividends across this ticker+account's lots. Only include lots
     // where backfill succeeded; if NONE succeeded, divs is null (not "$0").
     let totalDivs = null;
@@ -6499,7 +6796,7 @@ function renderTrimWatch() {
     else if (allLT) { signal = 'Review — LT'; signalClass = 'signal-trail-lt'; }
     else { signal = 'Wait for LT'; signalClass = 'signal-trail-st'; }
 
-    return { ticker: g.ticker, account: g.account, totalAlpha, totalGl, totalExit, totalDivs, daysHeldMax, signal, signalClass, isIRA, allLT };
+    return { ticker: g.ticker, account: g.account, totalAlpha, totalTrAlpha, trAgg, totalGl, totalExit, totalDivs, daysHeldMax, signal, signalClass, isIRA, allLT };
   })
   .filter(r => r.totalAlpha !== null && r.totalAlpha < 0)
   .sort((a, b) => a.totalAlpha - b.totalAlpha)
@@ -6513,7 +6810,8 @@ function renderTrimWatch() {
   const header = `<div style="display:flex;justify-content:space-between;align-items:center;padding:0 0 6px;border-bottom:1px solid var(--color-border-tertiary);margin-bottom:4px">
       <span style="font-size:9px;color:var(--color-text-tertiary);width:52px;flex-shrink:0">Ticker</span>
       <span style="font-size:9px;color:var(--color-text-tertiary);width:52px;flex-shrink:0">Acct</span>
-      <span style="font-size:9px;color:var(--color-text-tertiary);width:80px;text-align:right;flex-shrink:0">$ Alpha</span>
+      <span style="font-size:9px;color:var(--color-text-tertiary);width:80px;text-align:right;flex-shrink:0" title="Dollar alpha — price-only on both sides">$ Alpha</span>
+      <span style="font-size:9px;color:var(--color-text-tertiary);width:80px;text-align:right;flex-shrink:0" title="Dollar TR alpha — includes dividends on both sides (yours + S&amp;P TR). Lots without div backfill count divs as $0, under-stating this number.">TR α</span>
       <span style="font-size:9px;color:var(--color-text-tertiary);width:76px;text-align:right;flex-shrink:0">G/L</span>
       <span style="font-size:9px;color:var(--color-text-tertiary);width:80px;text-align:right;flex-shrink:0">Signal</span>
       <span style="font-size:9px;color:var(--color-text-tertiary);width:44px;text-align:right;flex-shrink:0">Held</span>
@@ -6550,6 +6848,10 @@ function renderTrimWatch() {
       </span>
       <span style="font-size:9px;color:var(--color-text-tertiary);width:52px;flex-shrink:0">${esc(r.account)}</span>
       <span style="font-size:11px;color:${alphaColor};width:80px;text-align:right;flex-shrink:0">${fmtDollar(r.totalAlpha)}</span>
+      <span style="width:80px;flex-shrink:0;display:flex;flex-direction:column;align-items:flex-end;gap:0">
+        <span style="font-size:11px;color:${r.totalTrAlpha === null ? 'var(--color-text-tertiary)' : (r.totalTrAlpha >= 0 ? 'var(--color-text-success)' : 'var(--color-text-danger)')}">${r.totalTrAlpha === null ? '—' : fmtDollar(r.totalTrAlpha)}</span>
+        ${r.trAgg && r.trAgg.coverage === 'partial' ? `<span style="font-size:7px;color:#fbbf24;font-style:italic;white-space:nowrap" title="${r.trAgg.lotsMissingDivs} of ${r.trAgg.lotsTotal} lots aren't div-backfilled. TR alpha is under-stated.">${r.trAgg.lotsMissingDivs}/${r.trAgg.lotsTotal} no divs</span>` : ''}
+      </span>
       <span style="font-size:11px;color:${glColor};width:76px;text-align:right;flex-shrink:0">${fmtDollar(r.totalGl)}</span>
       <span class="signal-badge ${r.signalClass}" style="flex-shrink:0;white-space:nowrap">${r.signal}</span>
       <span style="font-size:11px;color:${heldColor};width:44px;text-align:right;font-weight:600;flex-shrink:0">${heldLabel}</span>
@@ -8567,7 +8869,16 @@ function renderPostSell() {
     const dollarAlpha = (spxRet !== null && c.invested > 0)
       ? (c.exitValue - c.invested) - (c.invested * spxRet) : null;
 
-    return { p, c, daysHeld, priceToday, valueIfHeld, glIfHeld, retIfHeld, costOfSelling, spxSinceSale, spxDollarsSinceSale, dollarAlpha };
+    // TR alpha during hold (Batch 4 Phase 7) — dollar + pp.
+    // Uses aggregateRow* helpers wrapping a single-lot array. Same pattern
+    // as Phase 6 (closed-positions table) — coverage object covers both.
+    const trDol = aggregateRowTrAlpha([p]);
+    const trPp = aggregateRowTrAlphaPct([p]);
+    const trDollarAlpha = trDol.trAlpha;
+    const trPpAlpha = trPp.trAlphaPp;
+    const trCoverage = trDol.coverage; // same as trPp.coverage — share div status
+
+    return { p, c, daysHeld, priceToday, valueIfHeld, glIfHeld, retIfHeld, costOfSelling, spxSinceSale, spxDollarsSinceSale, dollarAlpha, trDollarAlpha, trPpAlpha, trCoverage };
   });
 
   // Summary stats
@@ -8576,6 +8887,17 @@ function renderPostSell() {
   const trail = analysed.filter(d => d.c.result === 'Trail').length;
   const totalGl = analysed.reduce((s, d) => s + (d.c.gainLoss || 0), 0);
   const totalAlpha = analysed.reduce((s, d) => s + (d.dollarAlpha || 0), 0);
+
+  // Phase 7 — TR alpha aggregate across all closed lots, plus coverage.
+  // Uses portfolio helper on the closed positions array; gives us a single
+  // dollar number + dividend-coverage flag for the summary footnote.
+  const closedTrAgg = calcDollarTrAlphaForPortfolio(closed);
+  const totalTrAlpha = closedTrAgg.trAlpha;
+  const trSummaryNote = closedTrAgg.coverage === 'partial'
+    ? `<div style="font-size:8px;color:#fbbf24;font-style:italic;margin-top:2px" title="${closedTrAgg.lotsMissingDivs} of ${closedTrAgg.lotsTotal} closed lots aren't div-backfilled. Their dividends count as $0, so this number under-states your TR alpha.">${closedTrAgg.lotsMissingDivs}/${closedTrAgg.lotsTotal} missing divs</div>`
+    : closedTrAgg.coverage === 'none' && closedTrAgg.lotsTotal > 0
+    ? `<div style="font-size:8px;color:#fbbf24;font-style:italic;margin-top:2px" title="No closed lots have been div-backfilled. Click ⟳ Backfill Dividends in the header.">divs not backfilled</div>`
+    : '';
 
   summaryEl.innerHTML = `
     <div class="summary-card">
@@ -8586,9 +8908,14 @@ function renderPostSell() {
       <div class="summary-card-label">Realised G/L</div>
       <div class="summary-card-value ${totalGl >= 0 ? 'success' : 'danger'}">${fmtDollar(totalGl)}</div>
     </div>
-    <div class="summary-card">
+    <div class="summary-card" title="Dollar alpha = realized gain minus what S&P 500 (price-only) would have produced over each lot's hold period. Price-only on both sides.">
       <div class="summary-card-label">Dollar Alpha (held)</div>
       <div class="summary-card-value ${totalAlpha >= 0 ? 'success' : 'danger'}">${fmtDollar(totalAlpha)}</div>
+    </div>
+    <div class="summary-card" title="Dollar TR Alpha = realized gain + dividends collected, minus S&P 500 Total Return (price + reinvested dividends) over each lot's hold period. The dividend-honest version of Dollar Alpha. Lots without div backfill count divs as $0, under-stating this number.">
+      <div class="summary-card-label">Dollar TR Alpha (held)</div>
+      <div class="summary-card-value ${totalTrAlpha === null ? '' : (totalTrAlpha >= 0 ? 'success' : 'danger')}">${totalTrAlpha === null ? '—' : fmtDollar(totalTrAlpha)}</div>
+      ${trSummaryNote}
     </div>
   `;
 
@@ -8634,7 +8961,7 @@ function renderPostSell() {
   // Cards sorted worst vs S&P first
   analysed.sort((a, b) => (a.c.vsSpx ?? 0) - (b.c.vsSpx ?? 0));
 
-  cardsEl.innerHTML = analysed.map(({ p, c, daysHeld, priceToday, valueIfHeld, glIfHeld, retIfHeld, costOfSelling, spxSinceSale, spxDollarsSinceSale, dollarAlpha }) => {
+  cardsEl.innerHTML = analysed.map(({ p, c, daysHeld, priceToday, valueIfHeld, glIfHeld, retIfHeld, costOfSelling, spxSinceSale, spxDollarsSinceSale, dollarAlpha, trDollarAlpha, trPpAlpha, trCoverage }) => {
     const verdictClass = c.result === 'Beat' ? 'verdict-beat' : c.result === 'Trail' ? 'verdict-trail' : 'verdict-tied';
     const glColor = c.gainLoss >= 0 ? 'var(--color-text-success)' : 'var(--color-text-danger)';
     const vsColor = c.vsSpx === null ? 'var(--color-text-tertiary)' : c.vsSpx > 0 ? 'var(--color-text-success)' : 'var(--color-text-danger)';
@@ -8699,6 +9026,15 @@ function renderPostSell() {
         <div>
           <div class="postsell-stat-label">Dollar Alpha</div>
           <div class="postsell-stat-value" style="color:${alphaColor}">${dollarAlpha !== null ? fmtDollar(dollarAlpha) : '—'}</div>
+        </div>
+        <div title="Dollar TR Alpha — realized gain + dividends collected, minus S&P 500 Total Return on the same capital. Dividend-honest version of Dollar Alpha.">
+          <div class="postsell-stat-label">TR Alpha</div>
+          <div class="postsell-stat-value" style="color:${trDollarAlpha === null ? 'var(--color-text-tertiary)' : (trDollarAlpha >= 0 ? 'var(--color-text-success)' : 'var(--color-text-danger)')}">${trDollarAlpha === null ? '—' : fmtDollar(trDollarAlpha)}</div>
+          ${trCoverage === 'partial' || trCoverage === 'none' ? `<div style="font-size:8px;color:#fbbf24;font-style:italic;margin-top:1px" title="This lot isn't div-backfilled. TR alpha is under-stated.">no divs</div>` : ''}
+        </div>
+        <div title="TR vs S&P TR — Your Total Return % minus S&P TR % over the hold period. Percentage-points view of the TR alpha.">
+          <div class="postsell-stat-label">TR vs S&P TR</div>
+          <div class="postsell-stat-value" style="color:${trPpAlpha === null ? 'var(--color-text-tertiary)' : (trPpAlpha >= 0 ? 'var(--color-text-success)' : 'var(--color-text-danger)')}">${trPpAlpha === null ? '—' : fmtPp(trPpAlpha)}</div>
         </div>
       </div>
       <div class="postsell-holding">${holdingStr}</div>
@@ -10137,6 +10473,28 @@ function renderSleeveRef() {
         }
         // If no theme benchmark mapped at all, show nothing (no clutter)
 
+        // TR vs S&P TR inline (Batch 4 Phase 8) — same compact format as
+        // themeAlphaInline above, but using S&P TR as the benchmark and
+        // including dividends on both sides. Reuses the per-row TR helpers
+        // from Phase 2 / Phase 6.
+        let trAlphaInline = '';
+        const trDol = aggregateRowTrAlpha(tickerLots);
+        const trPp = aggregateRowTrAlphaPct(tickerLots);
+        if (trDol.trAlpha !== null && trPp.trAlphaPp !== null) {
+          const trColor = trDol.trAlpha > 0 ? 'var(--color-text-success)'
+            : trDol.trAlpha < 0 ? 'var(--color-text-danger)'
+            : 'var(--color-text-tertiary)';
+          const trDollarStr = (trDol.trAlpha >= 0 ? '+' : '') + fmtDollarWhole(trDol.trAlpha);
+          const trPpStr = (trPp.trAlphaPp >= 0 ? '+' : '') + trPp.trAlphaPp.toFixed(0) + 'pp';
+          const trTooltip = 'TR vs S&P TR — your return + dividends minus S&P 500 Total Return on the same capital over the same hold period. Lots without div backfill count divs as $0, under-stating this number.';
+          // Coverage marker — small dot if partial/none coverage; tooltip explains.
+          const coverageMark = (trDol.coverage === 'partial' || trDol.coverage === 'none')
+            ? `<span style="color:#fbbf24;margin-left:2px" title="${trDol.lotsMissingDivs} of ${trDol.lotsTotal} lots missing div backfill — TR alpha under-stated">*</span>`
+            : '';
+          trAlphaInline = `<span style="font-size:9px;color:var(--color-text-tertiary);margin-left:8px" title="${trTooltip}">TR <span style="color:${trColor};font-weight:600">${trDollarStr}</span> <span style="color:${trColor};opacity:0.85">(${trPpStr})</span>${coverageMark}</span>`;
+        }
+        // If TR alpha can't be computed (no SPX TR data, no lots, etc.), show nothing.
+
         return `<div style="padding:5px 0;border-bottom:1px solid var(--color-border-tertiary);cursor:pointer" onclick="openTickerDrilldown(${jsAttrStr(t.ticker)},null)" title="Click for details">
           <div style="display:flex;justify-content:space-between;align-items:start">
             <div>
@@ -10152,9 +10510,10 @@ function renderSleeveRef() {
                 })()}
               </div>
             </div>
-            <div style="display:flex;align-items:baseline;gap:0;white-space:nowrap">
+            <div style="display:flex;align-items:baseline;gap:0;white-space:nowrap;flex-wrap:wrap;justify-content:flex-end">
               <span style="font-size:9px;color:var(--color-text-tertiary)">${fmtDollarWhole(t.value)}</span>
               ${themeAlphaInline}
+              ${trAlphaInline}
             </div>
           </div>
           <div style="display:flex;gap:8px;margin-top:2px;flex-wrap:wrap">
@@ -11124,6 +11483,109 @@ function dismissListingWarning(positionId) {
   if (typeof renderAll === 'function') renderAll();
 }
 
+// ─────────────────────────────────────────────
+// TR vs S&P TR card explainer modal (Batch 4 Phase 1)
+// Renders into the existing drilldown overlay. Two sections:
+//   1. What this metric measures (always shown)
+//   2. Listing-date flagged-lots explanation + affected tickers (when N>0)
+//
+// Hover tooltips were removed from the TR vs S&P TR card and its amber
+// flagged-line; this modal carries everything they used to say plus the
+// per-ticker breakdown.
+//
+// We deliberately DON'T set ov._lastDrilldownArgs here — this isn't a lot
+// drilldown and shouldn't interfere with the dismiss flow if a user later
+// opens a per-lot drilldown.
+// ─────────────────────────────────────────────
+function openTrCardExplainer() {
+  const ov = document.getElementById('drilldown-overlay');
+  const content = document.getElementById('drilldown-overlay-content');
+  if (!ov || !content) return;
+
+  // Compute flagged-lot breakdown by ticker (open positions only — matches
+  // the strip's posArr logic). countFlaggedLots / isLotFlagged from Batch 3.
+  const openPositions = positions.filter(function(p){ return !p.closed; });
+  const flaggedCount = countFlaggedLots(openPositions);
+
+  // Per-ticker flagged-lot counts for the affected-tickers list.
+  const tickerCounts = new Map();
+  for (const p of openPositions) {
+    if (!isLotFlagged(p)) continue;
+    const t = p.ticker || '(no ticker)';
+    tickerCounts.set(t, (tickerCounts.get(t) || 0) + 1);
+  }
+  // Sort by count desc, then ticker asc — matches what the user looks at.
+  const tickerEntries = Array.from(tickerCounts.entries()).sort(function(a, b){
+    if (b[1] !== a[1]) return b[1] - a[1];
+    return a[0].localeCompare(b[0]);
+  });
+
+  let html = '';
+
+  // Header
+  html += '<div style="margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--color-border-tertiary)">';
+  html += '<div style="font-size:20px;font-weight:700;color:var(--color-text-primary)">TR vs S&amp;P TR</div>';
+  html += '<div style="font-size:11px;color:var(--color-text-tertiary);margin-top:4px">What this card measures, and what flagged lots are about.</div>';
+  html += '</div>';
+
+  // Section 1 — What the metric measures (always shown)
+  html += '<div style="margin-bottom:18px">';
+  html += '<div style="font-size:11px;font-weight:700;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:8px">What this metric measures</div>';
+  html += '<div style="font-size:13px;line-height:1.55;color:var(--color-text-secondary)">';
+  html += '<strong>TR vs S&amp;P TR</strong> = Your Total Return minus the S&amp;P 500\'s Total Return over the same hold period, weighted by cost basis.';
+  html += '<br><br>';
+  html += '"Total Return" includes <em>price appreciation + dividends collected</em> on both sides — your lots\' dividends, and the S&amp;P 500\'s dividends reinvested at the index level.';
+  html += '<br><br>';
+  html += 'Positive (<span style="color:var(--color-text-success)">green</span>) means you beat the index after dividends. Negative (<span style="color:var(--color-text-danger)">red</span>) means a buy-and-hold S&amp;P investor would have done better with the same capital over the same time.';
+  html += '<br><br>';
+  html += 'Units are <strong>percentage points (pp)</strong>, not percent: a +5 pp gap means your TR was 5 points higher than the S&amp;P\'s TR (e.g. 12% vs 7%).';
+  html += '</div>';
+  html += '</div>';
+
+  // Section 2 — Flagged lots, only when N > 0
+  if (flaggedCount > 0) {
+    html += '<div style="margin-top:18px;padding-top:18px;border-top:1px solid var(--color-border-tertiary)">';
+    html += '<div style="font-size:11px;font-weight:700;color:#fbbf24;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:8px">⚠ ' + flaggedCount + ' lot' + (flaggedCount === 1 ? '' : 's') + ' flagged</div>';
+    html += '<div style="font-size:13px;line-height:1.55;color:var(--color-text-secondary)">';
+    html += 'These lots have a buy date that <strong>predates the ticker\'s actual listing</strong> — typically a spinoff cost-basis allocation. ';
+    html += 'For example: GE shareholders who got GEHC in the January 2023 spinoff often see GEHC lots with buy dates from years before GEHC existed, because the broker carried over the original GE buy date.';
+    html += '<br><br>';
+    html += 'Returns over that "hold period" are <strong>not meaningful</strong> — there\'s no real benchmark to compare against because the ticker didn\'t exist yet.';
+    html += '<br><br>';
+    html += 'The numbers above (Your TR %, S&amp;P TR %, the gap) <strong>still include these lots at face value</strong>. They\'re flagged informationally, not excluded. To dig in, click a 🚫 ticker on the Trim, Rebalance, or Sleeve Ref lists, or click any open-position row\'s ⓘ to see the per-lot warning and dismiss individually.';
+    html += '</div>';
+
+    // Affected-tickers list
+    if (tickerEntries.length > 0) {
+      html += '<div style="margin-top:14px;padding-top:12px;border-top:1px dashed var(--color-border-tertiary)">';
+      html += '<div style="font-size:10px;font-weight:700;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">Affected tickers</div>';
+      html += '<div style="font-size:12px;color:var(--color-text-secondary);line-height:1.7">';
+      const parts = tickerEntries.map(function(entry){
+        const ticker = entry[0];
+        const n = entry[1];
+        return '<span style="display:inline-block;background:var(--color-background-tertiary);padding:2px 8px;border-radius:4px;margin-right:4px;font-family:var(--font-mono);font-size:11px"><strong>' + esc(ticker) + '</strong> <span style="color:var(--color-text-tertiary)">(' + n + ')</span></span>';
+      });
+      html += parts.join(' ');
+      html += '</div>';
+      html += '</div>';
+    }
+
+    html += '</div>';
+  }
+
+  content.innerHTML = html;
+  ov.style.display = 'flex';
+  ov.style.flexDirection = 'column';
+  // Intentionally do NOT set ov._lastDrilldownArgs — this modal isn't a lot
+  // drilldown and shouldn't be re-rendered by dismissListingWarning.
+  // Clearing it defensively in case a stale value lingers from a previous
+  // drilldown open: if the user opens this explainer THEN navigates to a
+  // per-lot drilldown by clicking a ticker, that drilldown will set its
+  // own args. We just don't want this modal to be the thing that gets
+  // re-rendered if dismiss runs from somewhere unexpected.
+  if (ov._lastDrilldownArgs) ov._lastDrilldownArgs = null;
+}
+
 function _renderDrilldownLotBlock(pos, d, isMultiLot, idx) {
   const fmtPctOrDash = function(v){
     if (v === null || v === undefined || isNaN(v)) return '<span style="color:var(--color-text-tertiary)">—</span>';
@@ -11992,6 +12454,11 @@ function renderRebalance() {
     const totalAlpha = tranches.every(d => d.dollarAlpha !== null)
       ? tranches.reduce((s, d) => s + d.dollarAlpha, 0) : null;
 
+    // TR alpha (Batch 4 Phase 5) — dividend-honest sibling of Dollar Alpha.
+    // Uses aggregateRowTrAlpha to sum per-lot TR alpha across this row's lots.
+    const trAgg = aggregateRowTrAlpha(tranches.map(d => d.p));
+    const totalTrAlpha = trAgg.trAlpha; // null if no lot can contribute
+
     // Theme alpha across tranches: sum of per-tranche themeAlphaDollar where computable.
     // If ANY tranche is missing theme alpha (no benchmark, no backfilled price, etc.),
     // the aggregate is null — we don't want to silently underrepresent the position.
@@ -12055,7 +12522,7 @@ function renderRebalance() {
 
     return { ticker: g.ticker, account: g.account, count, isIRA,
       holdingLabel, allLT, allST, daysHeldMin,
-      vsSpx, totalAlpha, totalThemeAlpha, totalGl, totalDivs, totalEstTax, totalInvested, totalExit, portfolioPct,
+      vsSpx, totalAlpha, totalTrAlpha, trAgg, totalThemeAlpha, totalGl, totalDivs, totalEstTax, totalInvested, totalExit, portfolioPct,
       industryPct, strategyPct, industryName, strategyName,
       signal, signalClass };
   });
@@ -12067,6 +12534,7 @@ function renderRebalance() {
     if (rebalSortCol === 'daysHeld') { av = a.daysHeldMin ?? 0; bv = b.daysHeldMin ?? 0; }
     else if (rebalSortCol === 'portfolioPct') { av = a.portfolioPct ?? 0; bv = b.portfolioPct ?? 0; }
     else if (rebalSortCol === 'dollarAlpha') { av = a.totalAlpha ?? -9999; bv = b.totalAlpha ?? -9999; }
+    else if (rebalSortCol === 'trAlpha') { av = a.totalTrAlpha ?? -9999; bv = b.totalTrAlpha ?? -9999; }
     else if (rebalSortCol === 'themeAlpha') { av = a.totalThemeAlpha ?? -9999; bv = b.totalThemeAlpha ?? -9999; }
     else if (rebalSortCol === 'gl') { av = a.totalGl ?? -9999; bv = b.totalGl ?? -9999; }
     else if (rebalSortCol === 'estTax') { av = a.totalEstTax ?? 0; bv = b.totalEstTax ?? 0; }
@@ -12075,7 +12543,7 @@ function renderRebalance() {
   });
 
   // Update sort indicators
-  ['ticker','daysHeld','portfolioPct','dollarAlpha','themeAlpha','gl'].forEach(col => {
+  ['ticker','daysHeld','portfolioPct','dollarAlpha','trAlpha','themeAlpha','gl'].forEach(col => {
     const el = document.getElementById('sort-' + col);
     if (el) el.textContent = rebalSortCol === col ? (rebalSortDir === 1 ? ' ↑' : ' ↓') : '';
     const th = el?.closest('th');
@@ -12083,7 +12551,7 @@ function renderRebalance() {
   });
 
   if (rows.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="10" class="no-rows">No open positions to analyse.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="11" class="no-rows">No open positions to analyse.</td></tr>`;
     return;
   }
 
@@ -12168,6 +12636,13 @@ function renderRebalance() {
       <td class="r" style="font-size:10px;color:var(--color-text-tertiary)">${r.industryPct !== null ? r.industryPct.toFixed(1) + '%' : '—'}</td>
       <td class="r" style="font-weight:700;font-size:13px;background:${alphaBg};color:${alphaColor}">${r.totalAlpha !== null ? fmtDollar(r.totalAlpha) : '—'}</td>
       <td class="r" style="font-weight:600;font-size:12px;background:${(() => {
+          if (r.totalTrAlpha === null) return 'transparent';
+          return r.totalTrAlpha > 0 ? 'rgba(74,222,128,0.10)' : 'rgba(248,113,113,0.10)';
+        })()};color:${(() => {
+          if (r.totalTrAlpha === null) return 'var(--color-text-tertiary)';
+          return r.totalTrAlpha > 0 ? 'var(--color-text-success)' : 'var(--color-text-danger)';
+        })()}">${r.totalTrAlpha !== null ? fmtDollar(r.totalTrAlpha) : '—'}${r.trAgg && r.trAgg.coverage === 'partial' ? `<br><span style="font-size:8px;color:#fbbf24;font-style:italic;font-weight:400" title="${r.trAgg.lotsMissingDivs} of ${r.trAgg.lotsTotal} lots aren't div-backfilled. TR α is under-stated.">${r.trAgg.lotsMissingDivs}/${r.trAgg.lotsTotal} no divs</span>` : ''}</td>
+      <td class="r" style="font-weight:600;font-size:12px;background:${(() => {
           if (r.totalThemeAlpha === null) return 'transparent';
           return r.totalThemeAlpha > 0 ? 'rgba(74,222,128,0.10)' : 'rgba(248,113,113,0.10)';
         })()};color:${(() => {
@@ -12200,13 +12675,13 @@ function renderAll() {
   const closedTbody = document.getElementById('closed-tbody');
 
   if (open.length === 0) {
-    openTbody.innerHTML = `<tr><td colspan="18" class="no-rows">No open positions. Click + Add Position to get started.</td></tr>`;
+    openTbody.innerHTML = `<tr><td colspan="23" class="no-rows">No open positions. Click + Add Position to get started.</td></tr>`;
   } else {
     openTbody.innerHTML = open.map(renderRow).join('');
   }
 
   if (closed.length === 0) {
-    closedTbody.innerHTML = `<tr><td colspan="18" class="no-rows">No closed positions yet.</td></tr>`;
+    closedTbody.innerHTML = `<tr><td colspan="22" class="no-rows">No closed positions yet.</td></tr>`;
   } else {
     closedTbody.innerHTML = closed.map(renderClosedRow).join('');
   }
