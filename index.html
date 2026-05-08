@@ -803,11 +803,13 @@
     <button id="backfill-btn" class="btn btn-sm" onclick="backfillThemeBenchmarks()" style="font-size:10px;padding:4px 12px" title="One-time historical fetch of benchmark prices on each position's buy/sell dates. Enables theme-relative alpha math.">⟳ Backfill Theme Benchmarks</button>
     <button id="backfill-spx-btn" class="btn btn-sm" onclick="backfillSpxAtBuy()" style="font-size:10px;padding:4px 12px" title="Fills the S&P Buy / S&P Exit columns where blank, using the calendar-nearest monthly snapshot from a baked-in S&P history table (1988→present). Granularity is monthly — accurate enough for return comparisons over multi-month/year holds, less precise for short holds in volatile months. No network call.">⟳ Backfill S&amp;P (monthly approx)</button>
     <button id="backfill-divs-btn" class="btn btn-sm" onclick="backfillDividends()" style="font-size:10px;padding:4px 12px" title="Fetches each ticker's dividend history from Polygon and computes total dividends collected per lot (cash_amount × shares, summed since buy date). One API call per unique ticker. Free tier rate limit means ~10 minutes for 50 positions.">⟳ Backfill Dividends</button>
+    <button id="listing-check-btn" class="btn btn-sm" onclick="checkListingDates()" style="font-size:10px;padding:4px 12px" title="Fetches each ticker's listing date from Polygon and flags lots whose buy date predates the listing (typically spinoff cost-basis allocations like GE → GEHC). Informational only — does NOT change any return math. One API call per unique ticker; ~13 seconds each due to rate limits.">⟳ Check Listings</button>
     <span id="refresh-status" style="font-size:10px;color:var(--color-text-tertiary)"></span>
     <span id="benchmark-status" style="font-size:10px;color:var(--color-text-tertiary)"></span>
     <span id="backfill-status" style="font-size:10px;color:var(--color-text-tertiary)"></span>
     <span id="backfill-spx-status" style="font-size:10px;color:var(--color-text-tertiary)"></span>
     <span id="backfill-divs-status" style="font-size:10px;color:var(--color-text-tertiary)"></span>
+    <span id="listing-check-status" style="font-size:10px;color:var(--color-text-tertiary)"></span>
     <span id="polygon-key-toggle" style="font-size:10px;color:var(--color-text-tertiary);cursor:pointer;text-decoration:underline" onclick="togglePolygonKey()">API Key</span>
   </div>
 </div>
@@ -827,6 +829,15 @@
     <span style="color:#fbbf24">⚠ Dividend backfill — these tickers didn't fetch:</span>
     <span id="backfill-divs-failures-list" style="color:var(--color-text-secondary)"></span>
     <span style="margin-left:auto;color:var(--color-text-tertiary);font-style:italic">Common causes: rate-limited (try again in a minute), API key issue, or the ticker isn't recognized by Polygon.</span>
+  </div>
+</div>
+
+<!-- Failure list for listing-date check. Hidden until populated. -->
+<div id="listing-check-failures" class="hidden" style="background:var(--color-background-secondary);border-bottom:1px solid var(--color-border-tertiary);padding:8px 20px;font-size:10px;color:var(--color-text-tertiary);font-family:var(--font-mono)">
+  <div style="display:flex;align-items:center;gap:10px">
+    <span style="color:#fbbf24">⚠ Listing-date check — these tickers didn't fetch:</span>
+    <span id="listing-check-failures-list" style="color:var(--color-text-secondary)"></span>
+    <span style="margin-left:auto;color:var(--color-text-tertiary);font-style:italic">Common causes: rate-limited (try again in a minute), unknown ticker (renamed/delisted symbols), or API key issue. Lots stay in their previous state on failure — safe to retry.</span>
   </div>
 </div>
 
@@ -2949,7 +2960,15 @@ function mkPos() {
     dividendsCount: null,         // how many ex-div dates contributed (sanity check)
     dividendsLastFetch: null,     // ISO timestamp of last fetch attempt (success OR failure)
     dividendsFetchOk: null,       // true if last fetch succeeded; false if it failed; null if never attempted
-    dividendsFormulaVersion: null // formula version used for this lot's computation; bumped on math changes to force re-fetch
+    dividendsFormulaVersion: null,// formula version used for this lot's computation; bumped on math changes to force re-fetch
+    // Listing-date check (Batch 3) — flags lots whose dateBought predates the
+    // ticker's actual listing date (e.g. spinoff cost-basis allocations like
+    // GE → GEHC where the broker assigned the original GE buy date to the new
+    // GEHC ticker). Informational only — does NOT change any math.
+    listingDate: null,            // ISO date from Polygon (list_date), or null if unfetched/unknown
+    listingDateCheck: null,       // 'ok' | 'predates' | 'unknown' | null (null = never checked)
+    listingDateLastFetch: null,   // ISO timestamp of last fetch attempt
+    listingDateOverride: false    // user-set "yes I know, suppress this lot's warning"
   };
 }
 
@@ -4936,6 +4955,9 @@ async function loadPositions() {
   // Run v1 → v2 migration on existing data (idempotent — only does work if needed)
   migratePositionsV1ToV2();
 
+  // Run listing-date field migration (Batch 3, idempotent)
+  migratePositionsListingFields();
+
   // Cleanup: remove fully-empty placeholder positions left over from any
   // previous seeding behaviour. Idempotent.
   cleanEmptyPlaceholders();
@@ -4975,6 +4997,28 @@ function migratePositionsV1ToV2() {
   });
   if (migrated > 0) {
     console.log(`Migrated ${migrated} position(s) from Ballast → Portfolio Balance Plays (structural)`);
+  }
+}
+
+// ─────────────────────────────────────────────
+// Schema migration: add listing-date check fields (Batch 3)
+// Idempotent. For any position missing one or more of the 4 listing-check
+// fields (because it predates Batch 3), assigns the default value. Existing
+// values are never overwritten — a lot that's already been checked keeps
+// its check result; a lot with the override set keeps it.
+// ─────────────────────────────────────────────
+function migratePositionsListingFields() {
+  let migrated = 0;
+  positions.forEach(p => {
+    let touched = false;
+    if (!('listingDate' in p))         { p.listingDate = null;          touched = true; }
+    if (!('listingDateCheck' in p))    { p.listingDateCheck = null;     touched = true; }
+    if (!('listingDateLastFetch' in p)){ p.listingDateLastFetch = null; touched = true; }
+    if (!('listingDateOverride' in p)) { p.listingDateOverride = false; touched = true; }
+    if (touched) migrated++;
+  });
+  if (migrated > 0) {
+    console.log(`Initialized listing-date fields on ${migrated} position(s)`);
   }
 }
 
@@ -5454,7 +5498,101 @@ function calcPortfolioTrSummary(posArr) {
   return out;
 }
 
-// Smoke tests — run once at page load only when ?drilldownTests=1 is set.
+// ─────────────────────────────────────────────
+// Listing-date check helpers (Batch 3)
+//
+// evaluateListingDate(pos): pure function — returns the appropriate
+// listingDateCheck value given a position's dateBought and listingDate.
+// Returns one of:
+//   'predates' — dateBought is before listingDate (spinoff-allocation flag)
+//   'ok'       — dateBought is on or after listingDate
+//   'unknown'  — listingDate is null (Polygon didn't return one); not warned
+//   null       — can't evaluate (missing/malformed dateBought)
+//
+// Used by checkListingDates() to set listingDateCheck after a successful
+// Polygon fetch. Also exposed for tests. Does NOT mutate the position.
+//
+// Date comparison is string-based on ISO YYYY-MM-DD, which sorts correctly.
+// We validate the format with a regex to avoid false flags from junk input.
+// ─────────────────────────────────────────────
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function evaluateListingDate(pos) {
+  const bought = pos && pos.dateBought;
+  const listed = pos && pos.listingDate;
+  if (!bought || !ISO_DATE_RE.test(bought)) return null;
+  if (!listed) return 'unknown';
+  if (!ISO_DATE_RE.test(listed)) return 'unknown'; // malformed listing date — treat as unknown rather than crash
+  return bought < listed ? 'predates' : 'ok';
+}
+
+// isLotFlagged(pos): true if this lot should display the warning UI.
+// Combines the check result with the user override.
+function isLotFlagged(pos) {
+  if (!pos) return false;
+  if (pos.listingDateOverride) return false;
+  return pos.listingDateCheck === 'predates';
+}
+
+// countFlaggedLots(posArr): how many lots in the array are currently flagged.
+// Used by the portfolio TR card amber line.
+function countFlaggedLots(posArr) {
+  if (!Array.isArray(posArr)) return 0;
+  let n = 0;
+  for (const p of posArr) {
+    if (isLotFlagged(p)) n++;
+  }
+  return n;
+}
+
+// hasFlaggedLot(posArr): convenience boolean version, used by row badges
+// where we just need to know "any underlying lot flagged?"
+function hasFlaggedLot(posArr) {
+  if (!Array.isArray(posArr)) return false;
+  for (const p of posArr) {
+    if (isLotFlagged(p)) return true;
+  }
+  return false;
+}
+
+// tickerHasFlaggedLot(ticker, accountFilter): row-badge predicate.
+// Mirrors the lot-selection logic of openTickerDrilldown so the badge
+// matches what the drilldown will show when clicked. accountFilter null
+// means "all accounts" (used by Sleeve Ref); a string matches one account
+// (used by Trim and Rebalance).
+function tickerHasFlaggedLot(ticker, accountFilter) {
+  if (!ticker) return false;
+  for (const p of positions) {
+    if (p.closed) continue;
+    if (p.ticker !== ticker) continue;
+    if (accountFilter !== null && accountFilter !== undefined) {
+      if ((p.account || '') !== accountFilter) continue;
+    }
+    if (isLotFlagged(p)) return true;
+  }
+  return false;
+}
+
+// renderListingWarningBadge(ticker, accountFilter): returns the 🚫 HTML
+// span if any underlying lot is flagged, or '' otherwise. Centralized so
+// all three row surfaces (Trim, Sleeve Ref, Rebalance) render identically.
+function renderListingWarningBadge(ticker, accountFilter) {
+  if (!tickerHasFlaggedLot(ticker, accountFilter)) return '';
+  // Count flagged lots for the tooltip
+  let n = 0;
+  for (const p of positions) {
+    if (p.closed) continue;
+    if (p.ticker !== ticker) continue;
+    if (accountFilter !== null && accountFilter !== undefined) {
+      if ((p.account || '') !== accountFilter) continue;
+    }
+    if (isLotFlagged(p)) n++;
+  }
+  const tooltip = n + ' lot' + (n === 1 ? '' : 's') + ' predate ticker listing — returns may be misleading';
+  return '<span style="font-size:10px;margin-left:3px;cursor:help" title="' + tooltip + '">🚫</span>';
+}
+
+
 function _runDrilldownTests() {
   const log = function(ok, label, detail) {
     const tag = ok ? '%cPASS' : '%cFAIL';
@@ -5555,6 +5693,117 @@ function _runDrilldownTests() {
       'Test 6: yourTrPct = 17.5% (under-counted)',
       'got ' + (ps2.yourTrPct === null ? 'null' : ps2.yourTrPct.toFixed(2)));
 
+  // ─── Batch 3: listing-date check helpers ───
+  // Test 7: evaluateListingDate — predates case (the GEHC scenario)
+  const lt1 = { dateBought: '2009-05-15', listingDate: '2023-01-04' };
+  log(evaluateListingDate(lt1) === 'predates',
+      'Test 7: predates flagged (bought 2009, listed 2023)',
+      'got ' + evaluateListingDate(lt1));
+
+  // Test 8: evaluateListingDate — ok case (bought after listing)
+  const lt2 = { dateBought: '2023-06-01', listingDate: '2023-01-04' };
+  log(evaluateListingDate(lt2) === 'ok',
+      'Test 8: ok when bought after listing');
+
+  // Test 9: evaluateListingDate — same day = ok (boundary)
+  const lt3 = { dateBought: '2023-01-04', listingDate: '2023-01-04' };
+  log(evaluateListingDate(lt3) === 'ok',
+      'Test 9: same-day buy = ok (boundary)');
+
+  // Test 10: evaluateListingDate — null listingDate = unknown
+  const lt4 = { dateBought: '2020-01-01', listingDate: null };
+  log(evaluateListingDate(lt4) === 'unknown',
+      'Test 10: null listingDate yields unknown (not warned)');
+
+  // Test 11: evaluateListingDate — missing dateBought = null (can't evaluate)
+  const lt5 = { dateBought: '', listingDate: '2023-01-04' };
+  log(evaluateListingDate(lt5) === null,
+      'Test 11: missing dateBought yields null');
+
+  // Test 12: evaluateListingDate — malformed dateBought = null
+  const lt6 = { dateBought: '15/05/2009', listingDate: '2023-01-04' };
+  log(evaluateListingDate(lt6) === null,
+      'Test 12: malformed dateBought yields null (no false flag)');
+
+  // Test 13: evaluateListingDate — malformed listingDate = unknown
+  const lt7 = { dateBought: '2009-05-15', listingDate: 'sometime-2023' };
+  log(evaluateListingDate(lt7) === 'unknown',
+      'Test 13: malformed listingDate treated as unknown (no crash)');
+
+  // Test 14: isLotFlagged — predates + no override = flagged
+  log(isLotFlagged({ listingDateCheck: 'predates', listingDateOverride: false }) === true,
+      'Test 14: predates without override is flagged');
+
+  // Test 15: isLotFlagged — override suppresses warning
+  log(isLotFlagged({ listingDateCheck: 'predates', listingDateOverride: true }) === false,
+      'Test 15: override suppresses flag');
+
+  // Test 16: isLotFlagged — unknown is NOT flagged (avoid false positives)
+  log(isLotFlagged({ listingDateCheck: 'unknown', listingDateOverride: false }) === false,
+      'Test 16: unknown does not flag');
+
+  // Test 17: isLotFlagged — null check (never run) is NOT flagged
+  log(isLotFlagged({ listingDateCheck: null, listingDateOverride: false }) === false,
+      'Test 17: never-checked lot does not flag');
+
+  // Test 18: countFlaggedLots / hasFlaggedLot
+  const portfolio3 = [
+    { listingDateCheck: 'predates', listingDateOverride: false },  // flagged
+    { listingDateCheck: 'predates', listingDateOverride: true },   // overridden
+    { listingDateCheck: 'ok',       listingDateOverride: false },  // ok
+    { listingDateCheck: 'unknown',  listingDateOverride: false },  // unknown
+    { listingDateCheck: null,       listingDateOverride: false }   // never checked
+  ];
+  log(countFlaggedLots(portfolio3) === 1, 'Test 18: countFlaggedLots = 1');
+  log(hasFlaggedLot(portfolio3) === true, 'Test 18: hasFlaggedLot = true');
+  log(hasFlaggedLot([]) === false, 'Test 18: hasFlaggedLot on empty = false');
+
+  // Test 19: migratePositionsListingFields — adds defaults to legacy lots,
+  // doesn't touch already-set fields. Run on a synthetic positions array.
+  const savedPositionsM = positions;
+  positions = [
+    // Legacy position (pre-Batch-3): all 4 fields missing
+    { id: 9001, ticker: 'OLD', shares: 1, pricePaid: 1 },
+    // Already-checked position: fields exist, must not be overwritten
+    { id: 9002, ticker: 'NEW', shares: 1, pricePaid: 1,
+      listingDate: '2023-01-04', listingDateCheck: 'ok',
+      listingDateLastFetch: '2025-12-01T00:00:00Z',
+      listingDateOverride: false },
+    // Partially migrated (only override set): must fill the rest, keep override
+    { id: 9003, ticker: 'PART', shares: 1, pricePaid: 1,
+      listingDateOverride: true }
+  ];
+  migratePositionsListingFields();
+  log(positions[0].listingDate === null
+      && positions[0].listingDateCheck === null
+      && positions[0].listingDateLastFetch === null
+      && positions[0].listingDateOverride === false,
+      'Test 19a: legacy position got all 4 defaults');
+  log(positions[1].listingDate === '2023-01-04'
+      && positions[1].listingDateCheck === 'ok'
+      && positions[1].listingDateLastFetch === '2025-12-01T00:00:00Z'
+      && positions[1].listingDateOverride === false,
+      'Test 19b: already-set fields preserved');
+  log(positions[2].listingDateOverride === true
+      && positions[2].listingDate === null
+      && positions[2].listingDateCheck === null
+      && positions[2].listingDateLastFetch === null,
+      'Test 19c: partial migration kept override, filled rest');
+  // Idempotency: second call should be a no-op
+  const beforeSecond = JSON.stringify(positions);
+  migratePositionsListingFields();
+  log(JSON.stringify(positions) === beforeSecond,
+      'Test 19d: migration is idempotent (second call is no-op)');
+  positions = savedPositionsM;
+
+  // Test 20: mkPos returns the new fields with correct defaults
+  const fresh = mkPos();
+  log(fresh.listingDate === null
+      && fresh.listingDateCheck === null
+      && fresh.listingDateLastFetch === null
+      && fresh.listingDateOverride === false,
+      'Test 20: mkPos sets listing-date defaults');
+
   console.log('%cDrilldown test suite complete.', 'color:#94a3b8;font-style:italic');
 }
 
@@ -5606,6 +5855,14 @@ function renderSummary(containerId, posArr, isOpen) {
     ? `<div style="font-size:8px;color:#fbbf24;font-style:italic;margin-top:2px" title="No lots have been div-backfilled. Click ⟳ Backfill Dividends in the header.">divs not backfilled</div>`
     : '';
 
+  // Listing-date flagged-lots note (Batch 3) — only shown on open-positions
+  // strip. Cards still compute including flagged lots; this is informational.
+  // Click the ⓘ on any row to see the per-lot warning in the modal.
+  const flaggedCount = isOpen ? countFlaggedLots(posArr) : 0;
+  const flaggedNote = flaggedCount > 0
+    ? `<div style="font-size:8px;color:#fbbf24;font-style:italic;margin-top:2px" title="${flaggedCount} lot${flaggedCount===1?'':'s'} have a buy date that predates the ticker's actual listing (typically spinoff cost-basis allocations). Their returns vs the S&amp;P over that 'hold period' are not meaningful. Open the per-lot drilldown (ⓘ) on any row to see details.">${flaggedCount} lot${flaggedCount===1?'':'s'} flagged — see modal for details</div>`
+    : '';
+
   el.innerHTML = `
     <div class="summary-card">
       <div class="summary-card-label">Total Invested</div>
@@ -5647,6 +5904,7 @@ function renderSummary(containerId, posArr, isOpen) {
     ${isOpen ? `<div class="summary-card" title="Your Total Return minus S&P Total Return. Positive = you beat the index after dividends on both sides.">
       <div class="summary-card-label">TR vs S&P TR</div>
       <div class="summary-card-value ${colorClass(tr.gapTrPp)}">${fmtPp(tr.gapTrPp)}</div>
+      ${flaggedNote}
     </div>` : ''}
     ${isOpen ? `<div class="summary-card" title="Total dividends collected across all open lots where backfill succeeded. ${tr && tr.coverage === 'partial' ? `Excludes ${tr.lotsMissingDivs} unfetched lot${tr.lotsMissingDivs===1?'':'s'}.` : ''}">
       <div class="summary-card-label">Total Divs</div>
@@ -6287,7 +6545,7 @@ function renderTrimWatch() {
 
     return `<div class="bw-row" style="justify-content:space-between;align-items:center;cursor:pointer" onclick="event.stopPropagation();openTickerDrilldown(${jsAttrStr(r.ticker)},${jsAttrStr(r.account)})" title="Click for per-lot detail">
       <span class="bw-ticker" style="color:var(--color-text-primary);width:52px;flex-shrink:0;display:flex;flex-direction:column;align-items:flex-start;gap:1px">
-        <span>${esc(r.ticker)}</span>
+        <span>${esc(r.ticker)}${renderListingWarningBadge(r.ticker, r.account)}</span>
         ${r.totalDivs !== null ? `<span style="font-size:8px;color:var(--color-text-tertiary);font-weight:400;white-space:nowrap" title="Total dividends collected across all open lots of ${esc(r.ticker)} in ${esc(r.account)}">div ${fmtDollarWhole(r.totalDivs)}</span>` : ''}
       </span>
       <span style="font-size:9px;color:var(--color-text-tertiary);width:52px;flex-shrink:0">${esc(r.account)}</span>
@@ -7245,7 +7503,50 @@ async function fetchSplitHistory(ticker) {
   }
 }
 
-// For a given ex-date, compute the cumulative split factor of all splits that
+// ─────────────────────────────────────────────
+// Fetch ticker reference data (Batch 3)
+// Returns { listDate, error }. listDate is the ISO YYYY-MM-DD string from
+// Polygon's /v3/reference/tickers/{TICKER} endpoint, or null if Polygon
+// didn't return one (some ADRs/foreign listings are missing it).
+//
+// Counts as 1 Polygon call. Pattern matches fetchDividendHistory exactly:
+// 12-second abort timeout, error strings for HTTP / 429 / not-authorized.
+// ─────────────────────────────────────────────
+async function fetchTickerListingDate(ticker) {
+  if (!polygonKey) return { listDate: null, error: 'no API key' };
+  const url = `https://api.polygon.io/v3/reference/tickers/${encodeURIComponent(ticker)}?apiKey=${polygonKey}`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 12000);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeoutId);
+    if (!res.ok) {
+      if (res.status === 429) return { listDate: null, error: 'rate-limited (429)' };
+      if (res.status === 404) return { listDate: null, error: 'ticker not found (404)' };
+      return { listDate: null, error: `HTTP ${res.status}` };
+    }
+    const data = await res.json();
+    if (data.status === 'NOT_AUTHORIZED') return { listDate: null, error: 'not authorized' };
+    // Endpoint returns { results: { list_date, ... } } when ticker exists.
+    // list_date may be missing for ADRs / foreign listings — return null,
+    // not an error. evaluateListingDate() will mark such lots 'unknown'.
+    if (!data.results || typeof data.results !== 'object') {
+      return { listDate: null, error: 'no results' };
+    }
+    const listDate = data.results.list_date || null;
+    // Validate format if present — guard against junk input downstream.
+    if (listDate && !/^\d{4}-\d{2}-\d{2}$/.test(listDate)) {
+      console.warn(`[fetchTickerListingDate] ${ticker} returned unusual list_date: ${listDate}`);
+      return { listDate: null, error: null }; // treat as unknown, not failure
+    }
+    return { listDate, error: null };
+  } catch (e) {
+    clearTimeout(timeoutId);
+    return { listDate: null, error: e.message || 'network error' };
+  }
+}
+
+
 // occurred AFTER that date. A 2-for-1 split AFTER the ex-date means dividends
 // paid before the split apply to half as many "modern" shares — so we divide
 // the historical cash_amount by 2 to get the equivalent split-adjusted value.
@@ -7547,6 +7848,202 @@ async function backfillDividends() {
     failuresListEl.textContent = items.join('  ·  ');
     failuresEl.classList.remove('hidden');
     console.warn('[backfillDividends] failed tickers:', byTicker);
+  }
+
+  scheduleSave();
+  renderAll();
+}
+
+
+// ─────────────────────────────────────────────
+// Listing-date check (Batch 3)
+// One Polygon /v3/reference/tickers/{T} call per UNIQUE ticker. Pattern
+// mirrors backfillDividends: 24h freshness skip, priority/stale triage,
+// 25s-per-ticker throttle to stay under the 5/min free-tier cap, failures
+// surfaced in #listing-check-failures.
+//
+// On success for a ticker: writes listingDate, listingDateCheck (computed
+// via evaluateListingDate from each lot's dateBought), and
+// listingDateLastFetch onto every lot of that ticker. Does NOT touch
+// listingDateOverride — user dismissals are sticky across re-checks.
+//
+// Failures: continue with the rest, surface in failures div, do not abort.
+// ─────────────────────────────────────────────
+async function checkListingDates() {
+  const status = document.getElementById('listing-check-status');
+  const btn = document.getElementById('listing-check-btn');
+  const failuresEl = document.getElementById('listing-check-failures');
+  const failuresListEl = document.getElementById('listing-check-failures-list');
+
+  const keyInput = document.getElementById('polygon-key-input');
+  if (keyInput && keyInput.value.trim()) polygonKey = keyInput.value.trim();
+  if (!polygonKey) await loadPolygonKey();
+
+  if (failuresEl) failuresEl.classList.add('hidden');
+  if (failuresListEl) failuresListEl.textContent = '';
+
+  if (!polygonKey) {
+    if (typeof togglePolygonKey === 'function') togglePolygonKey();
+    if (status) {
+      status.textContent = 'Enter your Polygon API key first';
+      status.style.color = '#fbbf24';
+    }
+    return;
+  }
+
+  // Group OPEN positions by ticker. Closed positions don't need listing
+  // checks — their drilldowns are historical and the warning would be
+  // noise. (If we want to flag closed lots later, easy to add.)
+  const tickerToLots = new Map();
+  for (const pos of positions) {
+    if (pos.closed) continue;
+    if (!pos.ticker || !pos.dateBought) continue;
+    const t = pos.ticker.trim().toUpperCase();
+    if (!tickerToLots.has(t)) tickerToLots.set(t, []);
+    tickerToLots.get(t).push(pos);
+  }
+
+  if (tickerToLots.size === 0) {
+    if (status) {
+      status.textContent = 'No open positions to check';
+      status.style.color = 'var(--color-text-success)';
+    }
+    return;
+  }
+
+  // Triage. Same shape as backfillDividends:
+  // - priority: any lot with listingDateLastFetch === null (never fetched)
+  //             OR listingDateCheck === null with a non-null lastFetch
+  //             (corrupt-ish state — re-try)
+  // - stale:    listingDateLastFetch >= FRESHNESS_HOURS old
+  // - skip:     all lots fresh AND have a definite check ('ok'/'predates'/'unknown')
+  const FRESHNESS_HOURS = 24;
+  const now = Date.now();
+  const freshThreshold = now - FRESHNESS_HOURS * 3600 * 1000;
+
+  const skipTickers = [];
+  const priorityTickers = [];
+  const staleTickers = [];
+
+  for (const [ticker, lots] of tickerToLots.entries()) {
+    let anyNeverTried = false;
+    let allFresh = true;
+
+    for (const lot of lots) {
+      if (lot.listingDateLastFetch === null || lot.listingDateLastFetch === undefined) {
+        anyNeverTried = true;
+        allFresh = false;
+        continue;
+      }
+      const lastMs = new Date(lot.listingDateLastFetch).getTime();
+      if (isNaN(lastMs) || lastMs < freshThreshold) {
+        allFresh = false;
+      }
+    }
+
+    if (anyNeverTried) {
+      priorityTickers.push(ticker);
+    } else if (allFresh) {
+      skipTickers.push(ticker);
+    } else {
+      staleTickers.push(ticker);
+    }
+  }
+
+  const workTickers = [...priorityTickers, ...staleTickers];
+
+  if (workTickers.length === 0) {
+    if (status) {
+      status.textContent = `✓ All ${skipTickers.length} tickers fresh (last check < ${FRESHNESS_HOURS}h ago) — nothing to fetch`;
+      status.style.color = 'var(--color-text-success)';
+    }
+    return;
+  }
+
+  if (btn) { btn.disabled = true; btn.textContent = '⟳ Checking listings…'; }
+  if (status) {
+    let msg = `Checking ${workTickers.length} ticker(s)`;
+    if (priorityTickers.length > 0) msg += ` · ${priorityTickers.length} new`;
+    if (skipTickers.length > 0) msg += ` · ${skipTickers.length} fresh (skipped)`;
+    msg += ` · 1 ticker per 13s to stay under Polygon's rate limit`;
+    status.textContent = msg;
+    status.style.color = '#fbbf24';
+  }
+
+  // Rate limiting: 1 ticker / 13s = ~4.6 calls/min, safely under 5/min.
+  // (backfillDividends uses 25s because it fires 2 calls per ticker; here
+  // it's 1 call per ticker so we can go faster.)
+  const waitMs = 13000;
+
+  let lotsUpdated = 0;
+  let lotsFlagged = 0;
+  const failed = [];
+  const nowIso = new Date().toISOString();
+
+  for (let i = 0; i < workTickers.length; i++) {
+    const ticker = workTickers[i];
+    const lots = tickerToLots.get(ticker);
+
+    const result = await fetchTickerListingDate(ticker);
+
+    if (result.error) {
+      // Don't write to lots on error — leave them in their previous state
+      // so a retry has a clean shot. Just record the failure.
+      failed.push({ ticker, reason: result.error });
+    } else {
+      // Success path — including listDate=null (treated as 'unknown').
+      const listDate = result.listDate; // may be null
+      for (const lot of lots) {
+        lot.listingDate = listDate;
+        lot.listingDateLastFetch = nowIso;
+        lot.listingDateCheck = evaluateListingDate(lot); // 'ok' | 'predates' | 'unknown' | null
+        lotsUpdated++;
+        if (lot.listingDateCheck === 'predates' && !lot.listingDateOverride) {
+          lotsFlagged++;
+        }
+      }
+    }
+
+    const done = i + 1;
+    let msg = `${done}/${workTickers.length} tickers checked · ${lotsUpdated} lots updated`;
+    if (lotsFlagged > 0) msg += ` · ${lotsFlagged} flagged`;
+    if (failed.length > 0) msg += ` · ${failed.length} failed`;
+    if (status) status.textContent = msg;
+
+    if (i + 1 < workTickers.length) {
+      await new Promise(r => setTimeout(r, waitMs));
+    }
+  }
+
+  if (btn) { btn.disabled = false; btn.textContent = '⟳ Check Listings'; }
+
+  const ts = new Date().toLocaleTimeString();
+  if (failed.length === 0) {
+    if (status) {
+      status.textContent = `✓ ${workTickers.length} tickers checked — ${lotsFlagged} lots flagged · ${ts}`;
+      status.style.color = lotsFlagged > 0 ? '#fbbf24' : 'var(--color-text-success)';
+    }
+  } else if (lotsUpdated > 0) {
+    if (status) {
+      status.textContent = `${workTickers.length - failed.length} checked · ${lotsFlagged} flagged · ${failed.length} failed · click again to retry · ${ts}`;
+      status.style.color = '#fbbf24';
+    }
+  } else {
+    if (status) {
+      status.textContent = `All ${failed.length} failed (likely rate-limited) · wait a minute then click again · ${ts}`;
+      status.style.color = 'var(--color-text-danger)';
+    }
+  }
+
+  if (failed.length > 0 && failuresEl && failuresListEl) {
+    const byTicker = {};
+    for (const f of failed) {
+      if (!byTicker[f.ticker]) byTicker[f.ticker] = f.reason;
+    }
+    const items = Object.entries(byTicker).map(([t, r]) => `${t} (${r})`);
+    failuresListEl.textContent = items.join('  ·  ');
+    failuresEl.classList.remove('hidden');
+    console.warn('[checkListingDates] failed tickers:', byTicker);
   }
 
   scheduleSave();
@@ -9644,7 +10141,7 @@ function renderSleeveRef() {
           <div style="display:flex;justify-content:space-between;align-items:start">
             <div>
               <div style="display:flex;align-items:center;gap:4px">
-                <span style="font-size:10px;font-weight:700;color:var(--color-text-primary)">${t.ticker}</span>
+                <span style="font-size:10px;font-weight:700;color:var(--color-text-primary)">${t.ticker}</span>${renderListingWarningBadge(t.ticker, null)}
                 ${(() => {
                   const pos = open.find(p => p.ticker === t.ticker);
                   const etfBadge = pos?.isETF ? `<span style="font-size:8px;background:#3a3a5a;color:#a0a0c0;padding:1px 4px;border-radius:3px;font-weight:700">ETF</span>` : '';
@@ -10600,6 +11097,31 @@ function _renderDrilldownModal(args) {
   content.innerHTML = html;
   ov.style.display = 'flex';
   ov.style.flexDirection = 'column';
+  // Stash the args used for this render so dismissListingWarning can
+  // re-render the SAME modal after mutating a position's override flag.
+  // Storing the args reference is fine: positions are mutated in place,
+  // so the topLots array still points at the right (now-updated) lots.
+  ov._lastDrilldownArgs = args;
+}
+
+// dismissListingWarning(positionId) — Batch 3
+// Sets listingDateOverride=true on a single position (per-lot dismiss, NOT
+// per-ticker — different lots of the same ticker can need different
+// overrides), persists, and re-renders the currently-open drilldown modal
+// so the warning disappears immediately.
+function dismissListingWarning(positionId) {
+  const pos = positions.find(function(p){ return p.id === positionId; });
+  if (!pos) { console.warn('dismissListingWarning: position', positionId, 'not found'); return; }
+  pos.listingDateOverride = true;
+  scheduleSave();
+  // Re-render the modal in place using the stashed args. Other render
+  // surfaces (row badges, TR card amber line) will refresh on the next
+  // renderAll(); call it explicitly so the row badge disappears too.
+  const ov = document.getElementById('drilldown-overlay');
+  if (ov && ov._lastDrilldownArgs) {
+    _renderDrilldownModal(ov._lastDrilldownArgs);
+  }
+  if (typeof renderAll === 'function') renderAll();
 }
 
 function _renderDrilldownLotBlock(pos, d, isMultiLot, idx) {
@@ -10624,6 +11146,23 @@ function _renderDrilldownLotBlock(pos, d, isMultiLot, idx) {
     : '';
 
   let h = '<div style="' + sep + '">';
+
+  // Listing-date warning (Batch 3) — predates check, suppressible per-lot.
+  // Renders BEFORE the meta line so the user sees the caveat before reading
+  // the bought-date and return numbers below.
+  if (isLotFlagged(pos)) {
+    h += '<div style="background:rgba(248,113,113,0.10);border:1px solid rgba(248,113,113,0.35);border-radius:var(--border-radius-md);padding:10px 12px;margin-bottom:10px;font-size:11px;line-height:1.45;color:var(--color-text-primary)">';
+    h += '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px">';
+    h += '<div style="flex:1">';
+    h += '<span style="font-size:13px;margin-right:4px">🚫</span>';
+    h += '<strong>' + esc(pos.ticker || '(no ticker)') + '</strong> didn\'t begin trading until <strong>' + esc(pos.listingDate || '?') + '</strong>. ';
+    h += 'This lot\'s bought-date (<strong>' + esc(pos.dateBought || '?') + '</strong>) is from a spinoff cost-basis allocation. ';
+    h += 'Returns over the "hold period" are not meaningful.';
+    h += '</div>';
+    h += '<a href="#" onclick="dismissListingWarning(' + pos.id + ');return false;" style="font-size:10px;color:var(--color-text-tertiary);text-decoration:underline;white-space:nowrap;flex-shrink:0" title="Suppress this warning for this lot only. Other lots of the same ticker keep their own warnings.">Dismiss warning</a>';
+    h += '</div>';
+    h += '</div>';
+  }
 
   // Lot meta line
   h += '<div style="display:flex;flex-wrap:wrap;gap:14px;font-size:11px;color:var(--color-text-secondary);margin-bottom:10px">';
@@ -11616,7 +12155,7 @@ function renderRebalance() {
 
     return `<tr style="cursor:pointer" onclick="openTickerDrilldown(${jsAttrStr(r.ticker)},${jsAttrStr(r.account)})" title="Click for per-lot detail">
       <td>
-        <span style="font-weight:700;font-size:13px">${esc(r.ticker)}</span>
+        <span style="font-weight:700;font-size:13px">${esc(r.ticker)}</span>${renderListingWarningBadge(r.ticker, r.account)}
         ${trancheNote}
         <br><span style="color:var(--color-text-tertiary);font-size:10px">${esc(r.account)}</span>
         <span style="font-size:9px;color:${holdColor};margin-left:6px">${r.holdingLabel}</span>
@@ -12048,6 +12587,8 @@ function importData(input) {
       if (data.benchmarkPricesDate) benchmarkPricesDate = data.benchmarkPricesDate;
       // Run v1 → v2 migration on imported data (idempotent)
       migratePositionsV1ToV2();
+      // Run listing-date field migration (Batch 3, idempotent)
+      migratePositionsListingFields();
       await savePositions();
       restoreSpxInput();
       renderAll();
