@@ -2929,7 +2929,8 @@ function mkPos() {
     dividendsCollected: null,     // dollar total of dividends received on this lot ($0 = no divs but fetch succeeded; null = never fetched or fetch failed)
     dividendsCount: null,         // how many ex-div dates contributed (sanity check)
     dividendsLastFetch: null,     // ISO timestamp of last fetch attempt (success OR failure)
-    dividendsFetchOk: null        // true if last fetch succeeded; false if it failed; null if never attempted
+    dividendsFetchOk: null,       // true if last fetch succeeded; false if it failed; null if never attempted
+    dividendsFormulaVersion: null // formula version used for this lot's computation; bumped on math changes to force re-fetch
   };
 }
 
@@ -6810,13 +6811,30 @@ async function fetchSplitHistory(ticker) {
 // paid before the split apply to half as many "modern" shares — so we divide
 // the historical cash_amount by 2 to get the equivalent split-adjusted value.
 // Returns 1.0 if no splits occurred after the date.
+//
+// IMPORTANT: Polygon's /v3/reference/splits lumps spinoffs in with traditional
+// stock splits. A spinoff (e.g. GE → GEHC in 2023, GE → GEV in 2024) is
+// represented as a "split" with awkward ratios like 1000:1281 — meant to
+// describe the price-value adjustment, not a share-count change. Applying
+// these as if they were real splits incorrectly scales dividend math.
+//
+// We filter by ratio: real splits use small integer ratios (1:2, 1:7, 8:1,
+// 2:3, etc.). Polygon's spinoff representations use ratios involving 1000+.
+// Threshold of >100 cleanly separates the two categories for normal
+// portfolios. Caveat: a genuinely-large traditional split (e.g. 200:1) would
+// be incorrectly filtered. Not common, but possible.
 function cumulativeSplitFactorAfter(splits, exDate) {
   if (!Array.isArray(splits) || splits.length === 0) return 1;
   let factor = 1;
   for (const s of splits) {
-    if (s.executionDate > exDate) {
-      factor *= (s.splitTo / s.splitFrom);
+    if (s.executionDate <= exDate) continue;
+    // Filter spinoff-style entries (Polygon represents these as splits with
+    // large numerators or denominators; real splits use small integers).
+    if (s.splitFrom > 100 || s.splitTo > 100) {
+      console.debug(`[cumulativeSplitFactorAfter] skipping likely-spinoff ${s.splitFrom}:${s.splitTo} on ${s.executionDate}`);
+      continue;
     }
+    factor *= (s.splitTo / s.splitFrom);
   }
   return factor;
 }
@@ -6851,14 +6869,27 @@ function sumDividendsInRange(dividends, splits, startDate, endDate, shares) {
 // Tiering & retry behavior (so re-clicking handles previously-failed tickers
 // quickly without re-fetching tickers that already succeeded):
 //   - Tier "skip": all lots of the ticker have dividendsFetchOk===true AND
-//     dividendsLastFetch within FRESHNESS_HOURS. We don't re-fetch.
+//     dividendsLastFetch within FRESHNESS_HOURS AND dividendsFormulaVersion
+//     matches the current formula. We don't re-fetch.
 //   - Tier 1 (priority, fetched first): tickers where any lot has fetchOk===false
-//     OR has never been fetched (lastFetch===null). These run before stale/refresh.
+//     OR has never been fetched (lastFetch===null) OR has an outdated
+//     formula version. These run before stale/refresh.
 //   - Tier 2: tickers with stale-but-successful data (older than freshness window).
+//
+// Formula version: bumped whenever the dividend math changes meaningfully.
+// This forces a re-fetch of any lot that was computed with an older version
+// of the math, so users automatically get corrected numbers on next click.
 //
 // Rate limit: 1 ticker per 25 seconds. Polygon free tier is 5 calls/min total,
 // and each ticker fires 2 calls (dividends + splits). 2 calls per 25 seconds
 // = 4.8 calls/min, just under the limit. Going faster causes 429s.
+
+// Formula version history:
+//   1 = original — Polygon's cash_amount used as-is (no split adjustment). WRONG for any ticker that has split.
+//   2 = added cumulative split adjustment from /v3/reference/splits.
+//   3 = added spinoff filter — skip splits with from/to > 100 (Polygon represents spinoffs as splits).
+const DIVIDENDS_FORMULA_VERSION = 3;
+
 async function backfillDividends() {
   const status = document.getElementById('backfill-divs-status');
   const btn = document.getElementById('backfill-divs-btn');
@@ -6920,6 +6951,7 @@ async function backfillDividends() {
     let anyFailed = false;
     let anyNeverTried = false;
     let anyMissingOkField = false;  // lots from before dividendsFetchOk was added
+    let anyOutdatedFormula = false; // lots computed with an older formula version
     let allFreshAndOk = true;
 
     for (const lot of lots) {
@@ -6928,6 +6960,12 @@ async function backfillDividends() {
       // treat as needing a fresh fetch (the math may have been wrong).
       if (lot.dividendsLastFetch && (lot.dividendsFetchOk === null || lot.dividendsFetchOk === undefined)) {
         anyMissingOkField = true;
+      }
+      // Lot has data computed with an older formula version — refetch to
+      // apply the latest math.
+      if (lot.dividendsFetchOk === true && lot.dividendsFormulaVersion !== DIVIDENDS_FORMULA_VERSION) {
+        anyOutdatedFormula = true;
+        allFreshAndOk = false;
       }
       if (lot.dividendsLastFetch === null || lot.dividendsLastFetch === undefined) {
         anyNeverTried = true;
@@ -6940,7 +6978,7 @@ async function backfillDividends() {
       }
     }
 
-    if (anyFailed || anyNeverTried || anyMissingOkField) {
+    if (anyFailed || anyNeverTried || anyMissingOkField || anyOutdatedFormula) {
       priorityTickers.push(ticker);
     } else if (allFreshAndOk) {
       skipTickers.push(ticker);
@@ -7008,6 +7046,7 @@ async function backfillDividends() {
         lot.dividendsCount = sum.count;
         lot.dividendsLastFetch = nowIso;
         lot.dividendsFetchOk = true;
+        lot.dividendsFormulaVersion = DIVIDENDS_FORMULA_VERSION;
         lotsUpdated++;
       }
     }
