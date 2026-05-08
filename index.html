@@ -2925,11 +2925,11 @@ function mkPos() {
     benchmarkPriceAtSell: null,   // benchmark price on sellDate (closed positions only)
     // Dividends — populated by backfillDividends(). Per-lot: dividends paid
     // by the company between dateBought and (sellDate or today), summed over
-    // shares. Approximate: doesn't account for share-count changes mid-hold,
-    // since the tracker treats lots as immutable post-purchase.
-    dividendsCollected: null,     // dollar total of dividends received on this lot
+    // shares and split-adjusted. See sumDividendsInRange() for math.
+    dividendsCollected: null,     // dollar total of dividends received on this lot ($0 = no divs but fetch succeeded; null = never fetched or fetch failed)
     dividendsCount: null,         // how many ex-div dates contributed (sanity check)
-    dividendsLastFetch: null      // ISO timestamp of last successful Polygon fetch
+    dividendsLastFetch: null,     // ISO timestamp of last fetch attempt (success OR failure)
+    dividendsFetchOk: null        // true if last fetch succeeded; false if it failed; null if never attempted
   };
 }
 
@@ -6847,6 +6847,18 @@ function sumDividendsInRange(dividends, splits, startDate, endDate, shares) {
 // Bulk backfill: walks every position and populates dividendsCollected.
 // Caches per-ticker dividend AND split history within a single run so
 // multiple lots of the same ticker only trigger one round of API calls.
+//
+// Tiering & retry behavior (so re-clicking handles previously-failed tickers
+// quickly without re-fetching tickers that already succeeded):
+//   - Tier "skip": all lots of the ticker have dividendsFetchOk===true AND
+//     dividendsLastFetch within FRESHNESS_HOURS. We don't re-fetch.
+//   - Tier 1 (priority, fetched first): tickers where any lot has fetchOk===false
+//     OR has never been fetched (lastFetch===null). These run before stale/refresh.
+//   - Tier 2: tickers with stale-but-successful data (older than freshness window).
+//
+// Rate limit: 1 ticker per 25 seconds. Polygon free tier is 5 calls/min total,
+// and each ticker fires 2 calls (dividends + splits). 2 calls per 25 seconds
+// = 4.8 calls/min, just under the limit. Going faster causes 429s.
 async function backfillDividends() {
   const status = document.getElementById('backfill-divs-status');
   const btn = document.getElementById('backfill-divs-btn');
@@ -6869,7 +6881,7 @@ async function backfillDividends() {
     return;
   }
 
-  // Group positions by ticker — one ticker, one pair of API calls.
+  // Group positions by ticker.
   const tickerToLots = new Map();
   for (const pos of positions) {
     if (!pos.ticker || !pos.dateBought) continue;
@@ -6888,65 +6900,125 @@ async function backfillDividends() {
     return;
   }
 
+  // Triage: classify each ticker into skip / priority / stale.
+  // FRESHNESS_HOURS = 24 — re-fetching daily makes sense for an
+  // occasionally-updated tracker. User can manually clear dividendsLastFetch
+  // on a position to force a refetch if needed.
+  const FRESHNESS_HOURS = 24;
+  const now = Date.now();
+  const freshThreshold = now - FRESHNESS_HOURS * 3600 * 1000;
+
+  const skipTickers = [];
+  const priorityTickers = [];   // never-fetched OR last-fetch-failed
+  const staleTickers = [];      // last-fetch succeeded but is old
+
+  for (const [ticker, lots] of tickerToLots.entries()) {
+    // For each ticker, look across all its lots and decide.
+    // - If ANY lot has fetchOk===false, it's priority (a previous run failed somewhere).
+    // - If ALL lots have fetchOk===true AND fresh lastFetch, skip.
+    // - Otherwise (stale or never-tried), it's stale.
+    let anyFailed = false;
+    let anyNeverTried = false;
+    let anyMissingOkField = false;  // lots from before dividendsFetchOk was added
+    let allFreshAndOk = true;
+
+    for (const lot of lots) {
+      if (lot.dividendsFetchOk === false) anyFailed = true;
+      // Lot has dividendsLastFetch but no dividendsFetchOk — pre-fix data,
+      // treat as needing a fresh fetch (the math may have been wrong).
+      if (lot.dividendsLastFetch && (lot.dividendsFetchOk === null || lot.dividendsFetchOk === undefined)) {
+        anyMissingOkField = true;
+      }
+      if (lot.dividendsLastFetch === null || lot.dividendsLastFetch === undefined) {
+        anyNeverTried = true;
+        allFreshAndOk = false;
+        continue;
+      }
+      const lastFetchMs = new Date(lot.dividendsLastFetch).getTime();
+      if (isNaN(lastFetchMs) || lastFetchMs < freshThreshold || lot.dividendsFetchOk !== true) {
+        allFreshAndOk = false;
+      }
+    }
+
+    if (anyFailed || anyNeverTried || anyMissingOkField) {
+      priorityTickers.push(ticker);
+    } else if (allFreshAndOk) {
+      skipTickers.push(ticker);
+    } else {
+      staleTickers.push(ticker);
+    }
+  }
+
+  // Final work list: priority first, then stale.
+  const workTickers = [...priorityTickers, ...staleTickers];
+
+  if (workTickers.length === 0) {
+    if (status) {
+      status.textContent = `✓ All ${skipTickers.length} tickers fresh (last fetch < ${FRESHNESS_HOURS}h ago) — nothing to fetch`;
+      status.style.color = 'var(--color-text-success)';
+    }
+    return;
+  }
+
   if (btn) { btn.disabled = true; btn.textContent = '⟳ Fetching dividends…'; }
   if (status) {
-    status.textContent = `Fetching dividend + split history for ${tickerToLots.size} tickers (Polygon rate limit)…`;
+    let msg = `Fetching ${workTickers.length} ticker(s)`;
+    if (priorityTickers.length > 0) msg += ` · ${priorityTickers.length} prioritized as previously-failed/new`;
+    if (skipTickers.length > 0) msg += ` · ${skipTickers.length} fresh (skipped)`;
+    msg += ` · 1 ticker per 25s to stay under Polygon's rate limit`;
+    status.textContent = msg;
     status.style.color = '#fbbf24';
   }
 
-  const tickers = Array.from(tickerToLots.keys());
-  const batchSize = 2;
+  // Rate limiting: 1 ticker per 25 seconds. Each ticker fires 2 API calls
+  // (dividends + splits) in parallel. So 2 calls / 25s ≈ 4.8 calls/min,
+  // safely under Polygon's 5/min free-tier limit.
   const waitMs = 25000;
 
   let lotsUpdated = 0;
   const failed = [];
   const nowIso = new Date().toISOString();
 
-  for (let i = 0; i < tickers.length; i += batchSize) {
-    const batchTickers = tickers.slice(i, i + batchSize);
-    // For each ticker in the batch, fire dividends + splits in parallel.
-    const batchResults = await Promise.all(
-      batchTickers.map(async t => {
-        const [divResult, splitResult] = await Promise.all([
-          fetchDividendHistory(t),
-          fetchSplitHistory(t)
-        ]);
-        return { ticker: t, divResult, splitResult };
-      })
-    );
+  for (let i = 0; i < workTickers.length; i++) {
+    const ticker = workTickers[i];
+    const lots = tickerToLots.get(ticker);
 
-    for (const result of batchResults) {
-      const lots = tickerToLots.get(result.ticker);
-      // If dividends failed, the ticker is unusable — flag and move on.
-      if (result.divResult.error) {
-        for (const lot of lots) failed.push({ ticker: result.ticker, id: lot.id, reason: `divs: ${result.divResult.error}` });
-        continue;
-      }
-      // Splits failure is non-fatal: we proceed without split adjustment but
-      // flag a warning. For tickers that haven't split, splits=[] which is
-      // also fine. So only warn if splits explicitly errored.
-      let splitsForLot = result.splitResult.error ? [] : (result.splitResult.splits || []);
-      if (result.splitResult.error) {
-        console.warn(`[backfillDividends] ${result.ticker} splits fetch failed: ${result.splitResult.error}. Proceeding without split adjustment.`);
-      }
+    const [divResult, splitResult] = await Promise.all([
+      fetchDividendHistory(ticker),
+      fetchSplitHistory(ticker)
+    ]);
 
+    if (divResult.error) {
+      // Mark all lots of this ticker as failed for next-run priority.
+      for (const lot of lots) {
+        lot.dividendsLastFetch = nowIso;
+        lot.dividendsFetchOk = false;
+        failed.push({ ticker, id: lot.id, reason: `divs: ${divResult.error}` });
+      }
+    } else {
+      const splitsForLot = splitResult.error ? [] : (splitResult.splits || []);
+      if (splitResult.error) {
+        console.warn(`[backfillDividends] ${ticker} splits fetch failed: ${splitResult.error}. Proceeding without split adjustment.`);
+      }
       for (const lot of lots) {
         const shares = parseFloat(lot.shares) || 0;
         const endDate = lot.closed ? (lot.sellDate || null) : null;
-        const sum = sumDividendsInRange(result.divResult.dividends, splitsForLot, lot.dateBought, endDate, shares);
+        const sum = sumDividendsInRange(divResult.dividends, splitsForLot, lot.dateBought, endDate, shares);
         lot.dividendsCollected = sum.total;
         lot.dividendsCount = sum.count;
         lot.dividendsLastFetch = nowIso;
+        lot.dividendsFetchOk = true;
         lotsUpdated++;
       }
     }
 
-    const done = Math.min(i + batchSize, tickers.length);
-    let msg = `${done}/${tickers.length} tickers fetched · ${lotsUpdated} lots updated`;
+    const done = i + 1;
+    let msg = `${done}/${workTickers.length} tickers fetched · ${lotsUpdated} lots updated`;
     if (failed.length > 0) msg += ` · ${failed.length} failed`;
     if (status) status.textContent = msg;
 
-    if (i + batchSize < tickers.length) {
+    // Wait between tickers, except after the last one.
+    if (i + 1 < workTickers.length) {
       await new Promise(r => setTimeout(r, waitMs));
     }
   }
@@ -6956,17 +7028,17 @@ async function backfillDividends() {
   const ts = new Date().toLocaleTimeString();
   if (failed.length === 0) {
     if (status) {
-      status.textContent = `✓ Updated ${lotsUpdated} lots across ${tickers.length} tickers · ${ts}`;
+      status.textContent = `✓ Updated ${lotsUpdated} lots across ${workTickers.length} tickers · ${ts}`;
       status.style.color = 'var(--color-text-success)';
     }
   } else if (lotsUpdated > 0) {
     if (status) {
-      status.textContent = `${lotsUpdated} lots updated · ${failed.length} failed · ${ts}`;
+      status.textContent = `${lotsUpdated} lots updated · ${failed.length} failed · click again to retry failures · ${ts}`;
       status.style.color = '#fbbf24';
     }
   } else {
     if (status) {
-      status.textContent = `All ${failed.length} fetches failed · ${ts}`;
+      status.textContent = `All ${failed.length} failed (likely rate-limited) · wait a minute then click again · ${ts}`;
       status.style.color = 'var(--color-text-danger)';
     }
   }
