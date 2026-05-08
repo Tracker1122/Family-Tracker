@@ -231,6 +231,15 @@
   .btn-success:hover:not(:disabled) { background: var(--color-background-success); }
   .btn-sm { padding: 2px 6px; font-size: 9px; }
 
+  /* Drilldown ⓘ button — small subtle info trigger that lives next to a ticker.
+     Used by per-lot detail modal (Batch 2). */
+  .drilldown-info-btn {
+    background: transparent; border: none; padding: 0 2px;
+    color: var(--color-text-tertiary); font-size: 12px; line-height: 1;
+    cursor: pointer; opacity: 0.55; transition: opacity 0.12s;
+  }
+  .drilldown-info-btn:hover { opacity: 1; color: var(--color-text-info); }
+
   /* Fetch button states */
   .fetch-btn { min-width: 64px; }
   .fetch-btn.fetching { color: var(--color-text-info); border-color: rgba(96,165,250,0.3); }
@@ -779,7 +788,6 @@
     <button class="btn btn-sm" onclick="exportData()" style="margin-right:4px">⬇ Export Data</button>
     <label class="btn btn-sm" style="cursor:pointer;margin-right:4px">⬆ Import Data<input type="file" accept=".json" style="display:none" onchange="importData(this)"></label>
     <button class="btn btn-sm" onclick="openCSVImport()" style="margin-right:4px" title="Upload a tax-lot CSV from a brokerage">📄 Upload CSV</button>
-    <button class="btn btn-sm btn-danger" onclick="clearAll()">Clear All</button>
   </div>
 </div>
 
@@ -1822,6 +1830,17 @@
   <div style="background:var(--color-background-secondary);border:1px solid var(--color-border-secondary);border-radius:var(--border-radius-lg);padding:28px;max-width:520px;width:100%;position:relative;box-shadow:0 20px 60px rgba(0,0,0,0.5)">
     <button onclick="closeSpotlightOverlay()" style="position:absolute;top:12px;right:14px;background:none;border:none;color:var(--color-text-tertiary);font-size:18px;cursor:pointer;line-height:1">✕</button>
     <div id="spotlight-overlay-content"></div>
+  </div>
+</div>
+
+<!-- Per-position drilldown modal (Batch 2). Same visual language as the
+     spotlight overlay, slightly higher z-index so it sits on top if both
+     are ever open. Two sections: this lot (or lots in the clicked group)
+     up top, all-lots-of-this-ticker aggregate below. -->
+<div id="drilldown-overlay" style="display:none;position:fixed;inset:0;z-index:9100;background:rgba(0,0,0,0.6);align-items:center;justify-content:center;padding:20px" onclick="if(event.target===this)closePositionDrilldown()">
+  <div style="background:var(--color-background-secondary);border:1px solid var(--color-border-secondary);border-radius:var(--border-radius-lg);padding:28px;max-width:680px;width:100%;position:relative;box-shadow:0 20px 60px rgba(0,0,0,0.5);max-height:85vh;overflow-y:auto">
+    <button onclick="closePositionDrilldown()" style="position:absolute;top:12px;right:14px;background:none;border:none;color:var(--color-text-tertiary);font-size:18px;cursor:pointer;line-height:1">✕</button>
+    <div id="drilldown-overlay-content"></div>
   </div>
 </div>
 
@@ -5168,6 +5187,266 @@ function calcSummary(posArr) {
 }
 
 // ─────────────────────────────────────────────
+// Per-position drilldown math (Batch 2)
+//
+// calcPositionDrilldown(pos): pure function — takes one lot, returns
+// the numbers for the drilldown modal's "this specific lot" section.
+// For open positions: hold period is dateBought → today.
+// For closed positions: hold period is dateBought → sellDate.
+// S&P PRICE return uses lookupSpxClose (matches existing spxBuy/spxExit).
+// S&P TR return uses lookupSpxTrClose (new in Batch 1).
+//
+// All fields can be null when source data is missing (no buy date, no
+// price, no SPX coverage, dividends not backfilled). Caller renders "—".
+// ─────────────────────────────────────────────
+function calcPositionDrilldown(pos) {
+  const out = {
+    shares: null, pricePaid: null, currentPrice: null,
+    invested: null, currentValue: null,
+    priceGainLoss: null, priceReturnPct: null,
+    divsCollected: null, divsPerShare: null, divsFetched: false,
+    totalGainLoss: null, totalReturnPct: null,
+    spxPriceReturnPct: null, spxTrReturnPct: null,
+    gapVsSpxTr: null,
+    periodStart: null, periodEnd: null, periodLabel: null,
+    isClosed: !!pos.closed,
+    notes: []
+  };
+
+  const shares = parseFloat(pos.shares) || 0;
+  const pricePaid = parseFloat(pos.pricePaid) || 0;
+  // exitPrice holds "current price" for open lots and "sale price" for closed.
+  const currentOrExitPrice = parseFloat(pos.exitPrice) || 0;
+  out.shares = shares;
+  out.pricePaid = pricePaid;
+  out.currentPrice = currentOrExitPrice;
+
+  if (shares > 0 && pricePaid > 0) out.invested = shares * pricePaid;
+  if (shares > 0 && currentOrExitPrice > 0) out.currentValue = shares * currentOrExitPrice;
+
+  if (out.invested !== null && out.currentValue !== null) {
+    out.priceGainLoss = out.currentValue - out.invested;
+    out.priceReturnPct = (out.priceGainLoss / out.invested) * 100;
+  }
+
+  // Dividends — only meaningful if a successful backfill ran.
+  // null means "never fetched"; 0 with dividendsFetchOk=true means "no divs".
+  if (pos.dividendsFetchOk === true && typeof pos.dividendsCollected === 'number') {
+    out.divsCollected = pos.dividendsCollected;
+    out.divsFetched = true;
+    if (shares > 0) out.divsPerShare = pos.dividendsCollected / shares;
+  } else if (pos.dividendsFetchOk === false) {
+    out.notes.push('Dividend fetch failed for this lot — try Backfill Dividends.');
+  } else {
+    out.notes.push('Dividends not yet backfilled — click ⟳ Backfill Dividends in the header.');
+  }
+
+  // Total return = price gain + divs collected, divided by invested.
+  if (out.priceGainLoss !== null && out.invested > 0) {
+    const divsForTotal = out.divsCollected || 0;
+    out.totalGainLoss = out.priceGainLoss + divsForTotal;
+    out.totalReturnPct = (out.totalGainLoss / out.invested) * 100;
+  }
+
+  // Period bounds.
+  out.periodStart = pos.dateBought || null;
+  if (pos.closed) {
+    out.periodEnd = pos.sellDate || null;
+    out.periodLabel = 'Hold period (buy → sell)';
+  } else {
+    const t = new Date();
+    out.periodEnd = t.toISOString().slice(0, 10);
+    out.periodLabel = 'Hold period (buy → today)';
+  }
+
+  // S&P price return. Prefer the position's own spxBuy/spxExit if set
+  // (the user may have manually-fetched the exact daily close); fall back
+  // to monthly snapshot lookups otherwise.
+  let spxBuyVal = parseFloat(pos.spxBuy) || null;
+  let spxExitVal = parseFloat(pos.spxExit) || null;
+  if (!spxBuyVal && out.periodStart) {
+    const r = lookupSpxClose(out.periodStart);
+    if (r.price) spxBuyVal = r.price;
+  }
+  if (!spxExitVal) {
+    if (pos.closed && out.periodEnd) {
+      const r = lookupSpxClose(out.periodEnd);
+      if (r.price) spxExitVal = r.price;
+    } else if (!pos.closed && spxLive) {
+      spxExitVal = spxLive;
+    }
+  }
+  if (spxBuyVal && spxExitVal && spxBuyVal > 0) {
+    out.spxPriceReturnPct = ((spxExitVal - spxBuyVal) / spxBuyVal) * 100;
+  }
+
+  // S&P TR — monthly snapshots only. Less precise than spxBuy/spxExit
+  // (which can be daily), so the gap can be a few tenths of a pp off.
+  // Acceptable for the "honest comparison" — we're not benchmarking, just
+  // showing whether the lot kept up with index-with-divs-reinvested.
+  if (out.periodStart && out.periodEnd) {
+    const trBuy = lookupSpxTrClose(out.periodStart);
+    const trEnd = lookupSpxTrClose(out.periodEnd);
+    if (trBuy.price && trEnd.price && trBuy.price > 0) {
+      out.spxTrReturnPct = ((trEnd.price - trBuy.price) / trBuy.price) * 100;
+    } else {
+      if (trBuy.error) out.notes.push('S&P TR (start): ' + trBuy.error);
+      if (trEnd.error) out.notes.push('S&P TR (end): ' + trEnd.error);
+    }
+  }
+
+  if (out.totalReturnPct !== null && out.spxTrReturnPct !== null) {
+    out.gapVsSpxTr = out.totalReturnPct - out.spxTrReturnPct;
+  }
+
+  return out;
+}
+
+// aggregateTickerDrilldown(ticker, opts):
+// Sums the per-lot drilldowns across every lot of `ticker`. By default
+// includes open lots only; pass {includeClosed:true} to include closed.
+// Pass {accountFilter:'XYZ'} to restrict to one account.
+//
+// Aggregate %: weighted by invested capital (cost basis), not by lot count.
+// This matches calcSummary's weightedSpx convention.
+function aggregateTickerDrilldown(ticker, opts) {
+  opts = opts || {};
+  const includeClosed = !!opts.includeClosed;
+  const accountFilter = opts.accountFilter || null;
+
+  const lots = positions.filter(function(p){
+    if (p.ticker !== ticker) return false;
+    if (!includeClosed && p.closed) return false;
+    if (accountFilter !== null && (p.account || '') !== accountFilter) return false;
+    return true;
+  });
+
+  const out = {
+    lotCount: lots.length,
+    totalShares: 0, totalInvested: 0, totalCurrentValue: 0,
+    totalDivs: 0, anyDivsFetched: false, allDivsFetched: lots.length > 0,
+    totalPriceGainLoss: null, weightedPriceReturnPct: null,
+    totalReturnDollars: null, weightedTotalReturnPct: null,
+    weightedSpxPriceReturnPct: null, weightedSpxTrReturnPct: null,
+    gapVsSpxTr: null,
+    perLot: []
+  };
+
+  let priceGlSum = 0, priceGlInvestedDen = 0;
+  let totalGlSum = 0, totalGlInvestedDen = 0;
+  let spxPxNum = 0, spxPxDen = 0;
+  let spxTrNum = 0, spxTrDen = 0;
+
+  lots.forEach(function(p){
+    const d = calcPositionDrilldown(p);
+    out.perLot.push({ pos: p, d: d });
+
+    if (d.shares) out.totalShares += d.shares;
+    if (d.invested !== null) out.totalInvested += d.invested;
+    if (d.currentValue !== null) out.totalCurrentValue += d.currentValue;
+
+    if (d.divsFetched) {
+      out.totalDivs += d.divsCollected || 0;
+      out.anyDivsFetched = true;
+    } else {
+      out.allDivsFetched = false;
+    }
+
+    if (d.priceReturnPct !== null && d.invested > 0) {
+      priceGlSum += d.priceGainLoss;
+      priceGlInvestedDen += d.invested;
+    }
+    if (d.totalReturnPct !== null && d.invested > 0) {
+      totalGlSum += d.totalGainLoss;
+      totalGlInvestedDen += d.invested;
+    }
+    if (d.spxPriceReturnPct !== null && d.invested > 0) {
+      spxPxNum += d.spxPriceReturnPct * d.invested;
+      spxPxDen += d.invested;
+    }
+    if (d.spxTrReturnPct !== null && d.invested > 0) {
+      spxTrNum += d.spxTrReturnPct * d.invested;
+      spxTrDen += d.invested;
+    }
+  });
+
+  if (priceGlInvestedDen > 0) {
+    out.totalPriceGainLoss = priceGlSum;
+    out.weightedPriceReturnPct = (priceGlSum / priceGlInvestedDen) * 100;
+  }
+  if (totalGlInvestedDen > 0) {
+    out.totalReturnDollars = totalGlSum;
+    out.weightedTotalReturnPct = (totalGlSum / totalGlInvestedDen) * 100;
+  }
+  if (spxPxDen > 0) out.weightedSpxPriceReturnPct = spxPxNum / spxPxDen;
+  if (spxTrDen > 0) out.weightedSpxTrReturnPct = spxTrNum / spxTrDen;
+  if (out.weightedTotalReturnPct !== null && out.weightedSpxTrReturnPct !== null) {
+    out.gapVsSpxTr = out.weightedTotalReturnPct - out.weightedSpxTrReturnPct;
+  }
+
+  return out;
+}
+
+// Smoke tests — run once at page load only when ?drilldownTests=1 is set.
+function _runDrilldownTests() {
+  const log = function(ok, label, detail) {
+    const tag = ok ? '%cPASS' : '%cFAIL';
+    const css = ok ? 'color:#4ade80;font-weight:700' : 'color:#f87171;font-weight:700';
+    console.log(tag + '%c ' + label + (detail ? ' — ' + detail : ''), css, '');
+  };
+  const approx = function(a, b, eps) { return Math.abs(a - b) <= (eps || 0.01); };
+
+  const t1 = { shares: 10, pricePaid: 100, exitPrice: 150,
+    dateBought: '2023-01-15', closed: false,
+    spxBuy: 4000, spxExit: 5000, dividendsFetchOk: null };
+  const r1 = calcPositionDrilldown(t1);
+  log(r1.priceReturnPct !== null && approx(r1.priceReturnPct, 50),
+      'Test 1: price return = +50%', 'got ' + (r1.priceReturnPct === null ? 'null' : r1.priceReturnPct.toFixed(2)));
+  log(r1.spxPriceReturnPct !== null && approx(r1.spxPriceReturnPct, 25),
+      'Test 1: SPX price return = +25%', 'got ' + (r1.spxPriceReturnPct === null ? 'null' : r1.spxPriceReturnPct.toFixed(2)));
+  log(!r1.divsFetched, 'Test 1: dividends marked unfetched');
+  log(r1.totalReturnPct !== null && approx(r1.totalReturnPct, 50),
+      'Test 1: total return = price return when divs missing');
+
+  const t2 = { shares: 100, pricePaid: 50, exitPrice: 60,
+    dateBought: '2020-01-10', sellDate: '2024-01-10', closed: true,
+    spxBuy: 3300, spxExit: 4800,
+    dividendsFetchOk: true, dividendsCollected: 200, dividendsCount: 16 };
+  const r2 = calcPositionDrilldown(t2);
+  log(approx(r2.priceReturnPct, 20), 'Test 2: price return = +20%');
+  log(approx(r2.totalReturnPct, 24), 'Test 2: total return = +24% with divs');
+  log(approx(r2.divsPerShare, 2), 'Test 2: divs per share = $2');
+  log(r2.spxTrReturnPct !== null, 'Test 2: SPX TR resolved (closed, in range)');
+
+  const t3 = { shares: 10, pricePaid: 0, exitPrice: 0, closed: false };
+  const r3 = calcPositionDrilldown(t3);
+  log(r3.priceReturnPct === null && r3.totalReturnPct === null,
+      'Test 3: missing prices yield null returns, no crash');
+
+  const savedPositions = positions;
+  positions = [
+    { id: 901, ticker: 'TEST', account: 'A', shares: 10, pricePaid: 100,
+      exitPrice: 110, dateBought: '2023-06-01', closed: false,
+      spxBuy: 4200, spxExit: 5800,
+      dividendsFetchOk: true, dividendsCollected: 50 },
+    { id: 902, ticker: 'TEST', account: 'A', shares: 5, pricePaid: 200,
+      exitPrice: 240, dateBought: '2023-06-01', closed: false,
+      spxBuy: 4200, spxExit: 5800,
+      dividendsFetchOk: true, dividendsCollected: 25 }
+  ];
+  const agg = aggregateTickerDrilldown('TEST');
+  log(agg.lotCount === 2, 'Test 4: aggregate found both lots');
+  log(approx(agg.totalInvested, 2000), 'Test 4: total invested = 2000');
+  log(approx(agg.totalDivs, 75), 'Test 4: total divs = 75');
+  log(approx(agg.weightedTotalReturnPct, 18.75),
+      'Test 4: weighted total return = 18.75%',
+      'got ' + (agg.weightedTotalReturnPct === null ? 'null' : agg.weightedTotalReturnPct.toFixed(2)));
+  positions = savedPositions;
+
+  console.log('%cDrilldown test suite complete.', 'color:#94a3b8;font-style:italic');
+}
+
+// ─────────────────────────────────────────────
 // Formatting helpers
 // ─────────────────────────────────────────────
 function fmtDollar(v) {
@@ -5609,7 +5888,7 @@ function renderClosedRow(pos) {
   const d = v => v || '<span class="dash">—</span>';
   return `
   <tr class="closed-row" data-id="${pos.id}">
-    <td class="calc-cell" style="text-align:left">${d(esc(pos.ticker))}</td>
+    <td class="calc-cell" style="text-align:left">${pos.ticker ? `<span style="display:inline-flex;align-items:center;gap:4px">${esc(pos.ticker)}<button class="drilldown-info-btn" onclick="openPositionDrilldown(${pos.id})" title="Per-lot detail">ⓘ</button></span>` : '<span class="dash">—</span>'}</td>
     <td class="calc-cell" style="text-align:left">${d(esc(pos.account))}</td>
     <td class="calc-cell" style="text-align:left">${d(esc(pos.dateBought))}</td>
     <td class="calc-cell">${pos.shares || '<span class="dash">—</span>'}</td>
@@ -5675,7 +5954,7 @@ function renderRow(pos) {
 
   return `
   <tr class="${isClosed ? 'closed-row' : ''}" data-id="${pos.id}">
-    <td><input class="cell-input ticker-input" type="text" placeholder="AAPL" value="${esc(pos.ticker)}" onblur="setField(${pos.id},'ticker',this.value.toUpperCase())" oninput="this.value=this.value.toUpperCase()" ${isClosed?'disabled':''}></td>
+    <td><div style="display:flex;align-items:center;gap:4px"><input class="cell-input ticker-input" type="text" placeholder="AAPL" value="${esc(pos.ticker)}" onblur="setField(${pos.id},'ticker',this.value.toUpperCase())" oninput="this.value=this.value.toUpperCase()" ${isClosed?'disabled':''}>${pos.ticker ? `<button class="drilldown-info-btn" onclick="openPositionDrilldown(${pos.id})" title="Per-lot detail">ⓘ</button>` : ''}</div></td>
     <td><input class="cell-input account-input" type="text" placeholder="Brokerage" value="${esc(pos.account)}" onblur="setField(${pos.id},'account',this.value)" ${isClosed?'disabled':''}></td>
     <td><input class="cell-input date-input" type="text" placeholder="YYYY-MM-DD" value="${esc(pos.dateBought)}" onblur="handleDateBlur(${pos.id},'dateBought',this)" ${isClosed?'disabled':''}></td>
     <td class="calc-cell held-cell" style="text-align:center;white-space:nowrap">${(() => {
@@ -5725,6 +6004,16 @@ function renderRow(pos) {
 function esc(v) {
   if (v === null || v === undefined) return '';
   return String(v).replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Embed a JS string literal inside an HTML attribute value (e.g. inside an
+// onclick="..."). Outputs single-quoted JS literal with backslashes/quotes
+// escaped, then HTML-escapes the result so the attribute parser is happy.
+// Use: <div onclick="foo(${jsAttrStr(ticker)})">  →  onclick="foo('AAPL')"
+function jsAttrStr(v) {
+  if (v === null || v === undefined) return 'null';
+  const s = String(v).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n');
+  return ("'" + s + "'").replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // ─────────────────────────────────────────────
@@ -5849,7 +6138,7 @@ function renderTrimWatch() {
     const strategyPct = strategyTotal > 0 ? ((r.totalExit / strategyTotal) * 100).toFixed(1) + '%' : '—';
     const strategyColor = SLEEVE_COLORS[strategyName] || 'var(--color-text-tertiary)';
 
-    return `<div class="bw-row" style="justify-content:space-between;align-items:center">
+    return `<div class="bw-row" style="justify-content:space-between;align-items:center;cursor:pointer" onclick="openTickerDrilldown(${jsAttrStr(r.ticker)},${jsAttrStr(r.account)})" title="Click for details">
       <span class="bw-ticker" style="color:var(--color-text-primary);width:52px;flex-shrink:0">${esc(r.ticker)}</span>
       <span style="font-size:9px;color:var(--color-text-tertiary);width:52px;flex-shrink:0">${esc(r.account)}</span>
       <span style="font-size:11px;color:${alphaColor};width:80px;text-align:right;flex-shrink:0">${fmtDollar(r.totalAlpha)}</span>
@@ -7742,7 +8031,7 @@ function renderPostSell() {
     return `<div class="postsell-card">
       <div class="postsell-card-header">
         <div>
-          <div class="postsell-ticker">${esc(p.ticker)}</div>
+          <div class="postsell-ticker">${esc(p.ticker)} <button class="drilldown-info-btn" onclick="openPositionDrilldown(${p.id})" title="Per-lot detail">ⓘ</button></div>
           <div class="postsell-meta">${esc(p.account||'')}${p.account ? ' · ' : ''}${p.shares} shares @ $${p.pricePaid} → $${p.exitPrice}</div>
         </div>
         <span class="postsell-verdict ${verdictClass}">${c.result || '—'}</span>
@@ -9201,7 +9490,7 @@ function renderSleeveRef() {
         }
         // If no theme benchmark mapped at all, show nothing (no clutter)
 
-        return `<div style="padding:5px 0;border-bottom:1px solid var(--color-border-tertiary)">
+        return `<div style="padding:5px 0;border-bottom:1px solid var(--color-border-tertiary);cursor:pointer" onclick="openTickerDrilldown(${jsAttrStr(t.ticker)},null)" title="Click for details">
           <div style="display:flex;justify-content:space-between;align-items:start">
             <div>
               <div style="display:flex;align-items:center;gap:4px">
@@ -10049,6 +10338,249 @@ function showSpotlightOverlay(signal) {
 
   ov.style.display = 'flex';
   ov.style.flexDirection = 'column';
+}
+
+// ─────────────────────────────────────────────
+// Per-position drilldown overlay (Batch 2)
+//
+// Two entry points:
+//   openPositionDrilldown(positionId)
+//     — used when a single specific lot is the natural target (Post-Sell
+//       cards, the ⓘ button on the main Open table).
+//   openTickerDrilldown(ticker, accountFilter)
+//     — used when the click came from a ticker+account row that may span
+//       multiple lots (Trim Candidates, Rebalance & Tax). Pass null for
+//       accountFilter to span all accounts (Sleeve Ref).
+//
+// Both render the same modal layout: top section = the lot(s) that match
+// the click target, bottom section = aggregate of all open lots of the
+// ticker. Single-lot top section is rendered with the same block style
+// as multi-lot, intentionally — keeps the visual consistent.
+// ─────────────────────────────────────────────
+function closePositionDrilldown() {
+  const ov = document.getElementById('drilldown-overlay');
+  if (ov) ov.style.display = 'none';
+}
+
+function openPositionDrilldown(positionId) {
+  const pos = positions.find(function(p){ return p.id === positionId; });
+  if (!pos) { console.warn('drilldown: position', positionId, 'not found'); return; }
+  _renderDrilldownModal({
+    ticker: pos.ticker,
+    topLots: [pos],
+    accountForHeader: pos.account || ''
+  });
+}
+
+function openTickerDrilldown(ticker, accountFilter) {
+  if (!ticker) return;
+  const topLots = positions.filter(function(p){
+    if (p.closed || p.ticker !== ticker) return false;
+    if (accountFilter === null || accountFilter === undefined) return true;
+    return (p.account || '') === accountFilter;
+  });
+  if (topLots.length === 0) {
+    console.warn('drilldown: no open lots for', ticker, accountFilter);
+    return;
+  }
+  _renderDrilldownModal({
+    ticker: ticker,
+    topLots: topLots,
+    accountForHeader: accountFilter || ''
+  });
+}
+
+function _renderDrilldownModal(args) {
+  const ticker = args.ticker;
+  const topLots = args.topLots;
+  const accountForHeader = args.accountForHeader;
+
+  const ov = document.getElementById('drilldown-overlay');
+  const content = document.getElementById('drilldown-overlay-content');
+  if (!ov || !content) return;
+
+  let html = '';
+
+  // Header
+  html += '<div style="margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--color-border-tertiary)">';
+  html += '<div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">';
+  html += '<span style="font-size:20px;font-weight:700;color:var(--color-text-primary)">' + esc(ticker) + '</span>';
+  if (accountForHeader) {
+    html += '<span style="font-size:11px;color:var(--color-text-tertiary)">' + esc(accountForHeader) + '</span>';
+  }
+  const sleeve = (topLots[0] && topLots[0].sleeve) || '';
+  const theme = (topLots[0] && topLots[0].theme) || '';
+  if (sleeve) {
+    const sleeveColor = SLEEVE_COLORS[sleeve] || 'var(--color-text-tertiary)';
+    html += '<span style="font-size:10px;font-weight:600;color:' + sleeveColor + ';border-left:3px solid ' + sleeveColor + ';padding-left:6px">' + esc(sleeve) + '</span>';
+  }
+  if (theme) {
+    html += '<span style="font-size:10px;color:var(--color-text-tertiary)">' + esc(theme) + '</span>';
+  }
+  html += '</div></div>';
+
+  // Top section: the lot(s) the user clicked
+  const topHeading = topLots.length === 1
+    ? 'This lot'
+    : 'These lots (' + topLots.length + ')';
+  html += '<div style="font-size:11px;font-weight:700;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:10px">' + topHeading + '</div>';
+
+  topLots.forEach(function(p, idx){
+    const d = calcPositionDrilldown(p);
+    html += _renderDrilldownLotBlock(p, d, topLots.length > 1, idx);
+  });
+
+  // Bottom section: aggregate of ALL open lots of this ticker (across accounts)
+  const agg = aggregateTickerDrilldown(ticker, { includeClosed: false, accountFilter: null });
+
+  html += '<div style="margin-top:24px;padding-top:18px;border-top:1px solid var(--color-border-tertiary)">';
+  html += '<div style="font-size:11px;font-weight:700;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:10px">All open ' + esc(ticker) + ' lots (' + agg.lotCount + ')</div>';
+  html += _renderDrilldownAggregateBlock(agg);
+  html += '</div>';
+
+  content.innerHTML = html;
+  ov.style.display = 'flex';
+  ov.style.flexDirection = 'column';
+}
+
+function _renderDrilldownLotBlock(pos, d, isMultiLot, idx) {
+  const fmtPctOrDash = function(v){
+    if (v === null || v === undefined || isNaN(v)) return '<span style="color:var(--color-text-tertiary)">—</span>';
+    return (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
+  };
+  const fmtDollarOrDash = function(v){
+    if (v === null || v === undefined || isNaN(v)) return '<span style="color:var(--color-text-tertiary)">—</span>';
+    return fmtDollar(v);
+  };
+
+  const yourColor = d.totalReturnPct === null ? 'var(--color-text-tertiary)'
+    : d.totalReturnPct >= 0 ? 'var(--color-text-success)' : 'var(--color-text-danger)';
+  const spxColor = d.spxTrReturnPct === null ? 'var(--color-text-tertiary)'
+    : d.spxTrReturnPct >= 0 ? 'var(--color-text-success)' : 'var(--color-text-danger)';
+  const gapColor = d.gapVsSpxTr === null ? 'var(--color-text-tertiary)'
+    : d.gapVsSpxTr >= 0 ? 'var(--color-text-success)' : 'var(--color-text-danger)';
+
+  const sep = (isMultiLot && idx > 0)
+    ? 'border-top:1px dashed var(--color-border-tertiary);padding-top:14px;margin-top:14px'
+    : '';
+
+  let h = '<div style="' + sep + '">';
+
+  // Lot meta line
+  h += '<div style="display:flex;flex-wrap:wrap;gap:14px;font-size:11px;color:var(--color-text-secondary);margin-bottom:10px">';
+  h += '<span><span style="color:var(--color-text-tertiary)">Bought</span> ' + esc(pos.dateBought || '—') + '</span>';
+  if (pos.account) h += '<span><span style="color:var(--color-text-tertiary)">Account</span> ' + esc(pos.account) + '</span>';
+  h += '<span><span style="color:var(--color-text-tertiary)">Shares</span> ' + (d.shares || '—') + '</span>';
+  h += '<span><span style="color:var(--color-text-tertiary)">Cost basis</span> ' + fmtDollarOrDash(d.invested) + '</span>';
+  if (pos.closed) {
+    h += '<span style="color:#fbbf24;font-weight:600">Closed ' + esc(pos.sellDate || '') + '</span>';
+  }
+  h += '</div>';
+
+  // Two-column layout: Your numbers / S&P numbers
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">';
+
+  h += '<div style="background:var(--color-background-tertiary);padding:12px;border-radius:var(--border-radius-md)">';
+  h += '<div style="font-size:9px;font-weight:700;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px">Your lot</div>';
+  h += _drilldownStat('Price return', fmtPctOrDash(d.priceReturnPct),
+       d.priceReturnPct === null ? 'var(--color-text-tertiary)'
+       : d.priceReturnPct >= 0 ? 'var(--color-text-success)' : 'var(--color-text-danger)');
+  if (d.divsFetched) {
+    const perShareStr = d.divsPerShare !== null ? ' ($' + d.divsPerShare.toFixed(2) + '/sh)' : '';
+    h += _drilldownStat('Dividends collected', fmtDollarOrDash(d.divsCollected) + '<span style="font-size:10px;color:var(--color-text-tertiary)">' + perShareStr + '</span>', 'var(--color-text-secondary)');
+  } else {
+    h += _drilldownStat('Dividends collected', '<span style="color:var(--color-text-tertiary);font-style:italic;font-size:10px">not backfilled</span>', 'var(--color-text-tertiary)');
+  }
+  h += _drilldownStat('Total return', fmtPctOrDash(d.totalReturnPct), yourColor, true);
+  h += '</div>';
+
+  h += '<div style="background:var(--color-background-tertiary);padding:12px;border-radius:var(--border-radius-md)">';
+  h += '<div style="font-size:9px;font-weight:700;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px">S&amp;P 500 (same period)</div>';
+  h += _drilldownStat('Price return', fmtPctOrDash(d.spxPriceReturnPct),
+       d.spxPriceReturnPct === null ? 'var(--color-text-tertiary)'
+       : d.spxPriceReturnPct >= 0 ? 'var(--color-text-success)' : 'var(--color-text-danger)');
+  h += _drilldownStat('Total return (TR)', fmtPctOrDash(d.spxTrReturnPct), spxColor);
+  h += _drilldownStat('Gap (you − S&P TR)', fmtPctOrDash(d.gapVsSpxTr), gapColor, true);
+  h += '</div>';
+
+  h += '</div>'; // end grid
+
+  if (d.notes && d.notes.length > 0) {
+    h += '<div style="margin-top:10px;font-size:10px;color:var(--color-text-tertiary);font-style:italic">';
+    h += d.notes.map(function(n){ return '· ' + esc(n); }).join('<br>');
+    h += '</div>';
+  }
+
+  h += '</div>';
+  return h;
+}
+
+function _renderDrilldownAggregateBlock(agg) {
+  const fmtPctOrDash = function(v){
+    if (v === null || v === undefined || isNaN(v)) return '<span style="color:var(--color-text-tertiary)">—</span>';
+    return (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
+  };
+  const fmtDollarOrDash = function(v){
+    if (v === null || v === undefined || isNaN(v)) return '<span style="color:var(--color-text-tertiary)">—</span>';
+    return fmtDollar(v);
+  };
+
+  if (agg.lotCount === 0) {
+    return '<div style="font-size:11px;color:var(--color-text-tertiary);font-style:italic">No open lots.</div>';
+  }
+
+  const yourColor = agg.weightedTotalReturnPct === null ? 'var(--color-text-tertiary)'
+    : agg.weightedTotalReturnPct >= 0 ? 'var(--color-text-success)' : 'var(--color-text-danger)';
+  const spxColor = agg.weightedSpxTrReturnPct === null ? 'var(--color-text-tertiary)'
+    : agg.weightedSpxTrReturnPct >= 0 ? 'var(--color-text-success)' : 'var(--color-text-danger)';
+  const gapColor = agg.gapVsSpxTr === null ? 'var(--color-text-tertiary)'
+    : agg.gapVsSpxTr >= 0 ? 'var(--color-text-success)' : 'var(--color-text-danger)';
+
+  let h = '';
+  h += '<div style="display:flex;flex-wrap:wrap;gap:14px;font-size:11px;color:var(--color-text-secondary);margin-bottom:10px">';
+  h += '<span><span style="color:var(--color-text-tertiary)">Shares</span> ' + (agg.totalShares % 1 === 0 ? agg.totalShares : agg.totalShares.toFixed(4)) + '</span>';
+  h += '<span><span style="color:var(--color-text-tertiary)">Cost basis</span> ' + fmtDollarOrDash(agg.totalInvested) + '</span>';
+  h += '<span><span style="color:var(--color-text-tertiary)">Current value</span> ' + fmtDollarOrDash(agg.totalCurrentValue) + '</span>';
+  if (agg.anyDivsFetched) {
+    const partialNote = agg.allDivsFetched ? '' : ' <span style="color:#fbbf24;font-style:italic">(partial)</span>';
+    h += '<span><span style="color:var(--color-text-tertiary)">Total divs</span> ' + fmtDollarOrDash(agg.totalDivs) + partialNote + '</span>';
+  } else {
+    h += '<span><span style="color:var(--color-text-tertiary)">Total divs</span> <span style="color:var(--color-text-tertiary);font-style:italic">not backfilled</span></span>';
+  }
+  h += '</div>';
+
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">';
+
+  h += '<div style="background:var(--color-background-tertiary);padding:12px;border-radius:var(--border-radius-md)">';
+  h += '<div style="font-size:9px;font-weight:700;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px">All your lots (cost-basis weighted)</div>';
+  h += _drilldownStat('Price return', fmtPctOrDash(agg.weightedPriceReturnPct),
+       agg.weightedPriceReturnPct === null ? 'var(--color-text-tertiary)'
+       : agg.weightedPriceReturnPct >= 0 ? 'var(--color-text-success)' : 'var(--color-text-danger)');
+  h += _drilldownStat('Total return', fmtPctOrDash(agg.weightedTotalReturnPct), yourColor, true);
+  h += '</div>';
+
+  h += '<div style="background:var(--color-background-tertiary);padding:12px;border-radius:var(--border-radius-md)">';
+  h += '<div style="font-size:9px;font-weight:700;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px">S&amp;P 500 (cost-basis weighted)</div>';
+  h += _drilldownStat('Price return', fmtPctOrDash(agg.weightedSpxPriceReturnPct),
+       agg.weightedSpxPriceReturnPct === null ? 'var(--color-text-tertiary)'
+       : agg.weightedSpxPriceReturnPct >= 0 ? 'var(--color-text-success)' : 'var(--color-text-danger)');
+  h += _drilldownStat('Total return (TR)', fmtPctOrDash(agg.weightedSpxTrReturnPct), spxColor);
+  h += _drilldownStat('Gap (you − S&P TR)', fmtPctOrDash(agg.gapVsSpxTr), gapColor, true);
+  h += '</div>';
+
+  h += '</div>';
+
+  return h;
+}
+
+function _drilldownStat(label, valueHtml, color, emphasize) {
+  const valSize = emphasize ? '14px' : '12px';
+  const valWeight = emphasize ? '700' : '600';
+  const borderTop = emphasize ? 'border-top:1px solid var(--color-border-tertiary);padding-top:6px;margin-top:4px' : '';
+  return '<div style="display:flex;justify-content:space-between;align-items:baseline;padding:3px 0;' + borderTop + '">'
+    + '<span style="font-size:10px;color:var(--color-text-tertiary)">' + label + '</span>'
+    + '<span style="font-size:' + valSize + ';font-weight:' + valWeight + ';color:' + color + ';font-family:var(--font-sans)">' + valueHtml + '</span>'
+    + '</div>';
 }
 
 // ─────────────────────────────────────────────
@@ -10915,7 +11447,7 @@ function renderRebalance() {
       soakTooltip = `Held ${d - soakThreshold} days past soak (${sleeve} threshold: ${soakThreshold}d)`;
     }
 
-    return `<tr>
+    return `<tr style="cursor:pointer" onclick="openTickerDrilldown(${jsAttrStr(r.ticker)},${jsAttrStr(r.account)})" title="Click for details">
       <td>
         <span style="font-weight:700;font-size:13px">${esc(r.ticker)}</span>
         ${trancheNote}
@@ -11938,6 +12470,14 @@ document.addEventListener('DOMContentLoaded', () => {
   dz.addEventListener('drop', csvHandleDrop);
   const acct = document.getElementById('csv-account-input');
   if (acct) acct.addEventListener('input', validateCsvForm);
+});
+
+// Batch 2 drilldown smoke tests — run when ?drilldownTests=1 is on URL.
+document.addEventListener('DOMContentLoaded', () => {
+  if (new URLSearchParams(location.search).get('drilldownTests') === '1') {
+    try { _runDrilldownTests(); }
+    catch (e) { console.error('Drilldown tests crashed:', e); }
+  }
 });
 
 // ─────────────────────────────────────────────
