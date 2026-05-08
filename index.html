@@ -6713,41 +6713,45 @@ async function backfillSpxAtBuy() {
 }
 
 // ─────────────────────────────────────────────
-// Dividend history (Polygon /v3/reference/dividends)
+// Dividend history (Polygon /v3/reference/dividends + /v3/reference/splits)
 //
 // For each position, sum the per-share dividends paid by the company between
-// the lot's buy date and (sell date or today), multiplied by shares held in
-// the lot. This is the "actual dividends collected on this lot" number — the
-// foundation of the total-return view.
+// the lot's buy date and (sell date or today), adjusted for stock splits and
+// multiplied by shares held in the lot. This is the "actual dividends
+// collected on this lot" number — the foundation of the total-return view.
 //
-// Source: Polygon's /v3/reference/dividends endpoint, which we verified does
-// work on the free tier (the snapshot/aggs endpoints do not, but reference
-// data is included). Returns up to ~limit ex-dividend records per call; we
-// use limit=1000 which covers decades of history in a single request.
+// IMPORTANT: Polygon's `cash_amount` is the NOMINAL amount paid at the time
+// of payment (in the share count of that era), NOT split-adjusted. So a
+// pre-2014 Apple dividend of $2.65 reflects what you got per *pre-split*
+// share. To compare it correctly to today's share counts, we must divide by
+// the cumulative split factor of all splits that occurred AFTER the
+// dividend's ex-date. So if you hold 50,400 split-adjusted AAPL shares today
+// and Apple paid $2.65 in 2013 (before two splits, 7:1 in 2014 and 4:1 in
+// 2020), the right per-share value to multiply by your 50,400 is
+// $2.65 / (7 × 4) = $0.0946.
 //
-// Honest approximations:
-//   - The lot's `shares` count is treated as constant over the hold. Reality:
-//     stock splits adjust the share count. Polygon's payouts are reported on
-//     a split-adjusted basis, so the math comes out right *on average* if the
-//     user has updated `shares` to reflect post-split counts. If the user has
-//     pre-split shares stored and the stock has split, the dividend total
-//     will be wrong by the split ratio. This is a known limitation.
-//   - Special / one-time dividends are included in the sum. Polygon's
-//     `dividend_type` is 'CD' for regular cash, 'SC'/'LT'/'ST' for specials.
-//     We don't filter — totals reflect "all cash you would have received."
+// Sources:
+//   /v3/reference/dividends — verified working on Polygon free tier
+//   /v3/reference/splits    — also reference data, also free tier
 //
-// Rate limiting: Polygon free tier limits aggs/snapshot endpoints to 5/min.
-// Reference endpoints are documented as more lenient but we use the same
-// conservative cadence (2/batch, 25s wait) as the other backfills. ~50
-// positions = ~10 minutes total runtime. Acceptable for a one-off action.
+// Approximations that remain (acknowledged):
+//   - Lot's `shares` is treated as constant across the hold. Tracker doesn't
+//     model intra-lot share-count changes (DRIP additions outside CSV import).
+//   - Special / one-time dividends are summed alongside regular dividends.
+//   - Spinoffs aren't handled (e.g., AT&T spun off WBD in 2022 — affected
+//     shareholders received WBD shares, which Polygon may not represent
+//     uniformly across data sources). This is a known limitation.
+//
+// Rate limiting: 2 tickers per batch with 25s waits. Each ticker makes 2
+// parallel API calls (dividends + splits). For ~10 unique tickers, total
+// runtime is ~2-3 minutes.
 // ─────────────────────────────────────────────
 
 // Fetch full dividend history for a ticker. Returns { dividends, error }
 // where dividends is an array of { exDate: 'YYYY-MM-DD', cashAmount: number }
-// sorted oldest-first, or [] if the ticker pays no dividends.
+// sorted oldest-first. Empty array (no error) means ticker has no dividends.
 async function fetchDividendHistory(ticker) {
   if (!polygonKey) return { dividends: null, error: 'no API key' };
-  // Tickers like BRK.B come in with a dot — Polygon uses BRK.B too, no rewrite needed.
   const url = `https://api.polygon.io/v3/reference/dividends?ticker=${encodeURIComponent(ticker)}&limit=1000&apiKey=${polygonKey}`;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 12000);
@@ -6755,14 +6759,12 @@ async function fetchDividendHistory(ticker) {
     const res = await fetch(url, { signal: controller.signal });
     clearTimeout(timeoutId);
     if (!res.ok) {
-      // 429 = rate-limited; surface the specific error so the user knows to back off.
       if (res.status === 429) return { dividends: null, error: 'rate-limited (429)' };
       return { dividends: null, error: `HTTP ${res.status}` };
     }
     const data = await res.json();
-    if (data.status === 'NOT_AUTHORIZED') return { dividends: null, error: 'not authorized (free tier may not include this ticker)' };
-    if (!Array.isArray(data.results)) return { dividends: [], error: null }; // no payments = empty array, not error
-    // Map and sort by ex-date ascending. Filter out any malformed entries.
+    if (data.status === 'NOT_AUTHORIZED') return { dividends: null, error: 'not authorized' };
+    if (!Array.isArray(data.results)) return { dividends: [], error: null };
     const divs = data.results
       .filter(r => r && r.ex_dividend_date && typeof r.cash_amount === 'number' && r.cash_amount >= 0)
       .map(r => ({ exDate: r.ex_dividend_date, cashAmount: r.cash_amount }))
@@ -6774,10 +6776,58 @@ async function fetchDividendHistory(ticker) {
   }
 }
 
-// Sum cash dividends paid between startDate (inclusive) and endDate (inclusive),
-// multiplied by shares. Returns { total: dollars, count: payouts }.
-// dividends array must be from fetchDividendHistory — { exDate, cashAmount } shape.
-function sumDividendsInRange(dividends, startDate, endDate, shares) {
+// Fetch stock split history for a ticker. Returns { splits, error } where
+// splits is an array of { executionDate, splitFrom, splitTo } sorted
+// oldest-first. Empty array (no error) means no recorded splits.
+async function fetchSplitHistory(ticker) {
+  if (!polygonKey) return { splits: null, error: 'no API key' };
+  const url = `https://api.polygon.io/v3/reference/splits?ticker=${encodeURIComponent(ticker)}&limit=1000&apiKey=${polygonKey}`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 12000);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeoutId);
+    if (!res.ok) {
+      if (res.status === 429) return { splits: null, error: 'rate-limited (429)' };
+      return { splits: null, error: `HTTP ${res.status}` };
+    }
+    const data = await res.json();
+    if (data.status === 'NOT_AUTHORIZED') return { splits: null, error: 'not authorized' };
+    if (!Array.isArray(data.results)) return { splits: [], error: null };
+    const splits = data.results
+      .filter(r => r && r.execution_date && typeof r.split_from === 'number' && typeof r.split_to === 'number' && r.split_from > 0)
+      .map(r => ({ executionDate: r.execution_date, splitFrom: r.split_from, splitTo: r.split_to }))
+      .sort((a, b) => a.executionDate.localeCompare(b.executionDate));
+    return { splits, error: null };
+  } catch (e) {
+    clearTimeout(timeoutId);
+    return { splits: null, error: e.message || 'network error' };
+  }
+}
+
+// For a given ex-date, compute the cumulative split factor of all splits that
+// occurred AFTER that date. A 2-for-1 split AFTER the ex-date means dividends
+// paid before the split apply to half as many "modern" shares — so we divide
+// the historical cash_amount by 2 to get the equivalent split-adjusted value.
+// Returns 1.0 if no splits occurred after the date.
+function cumulativeSplitFactorAfter(splits, exDate) {
+  if (!Array.isArray(splits) || splits.length === 0) return 1;
+  let factor = 1;
+  for (const s of splits) {
+    if (s.executionDate > exDate) {
+      factor *= (s.splitTo / s.splitFrom);
+    }
+  }
+  return factor;
+}
+
+// Sum split-adjusted cash dividends paid between startDate (inclusive) and
+// endDate (inclusive), multiplied by shares. Returns { total, count }.
+//   dividends: array from fetchDividendHistory — { exDate, cashAmount }
+//   splits:    array from fetchSplitHistory   — { executionDate, splitFrom, splitTo }
+//   startDate, endDate: 'YYYY-MM-DD' strings; endDate null means today
+//   shares: numeric, in current (split-adjusted) share count
+function sumDividendsInRange(dividends, splits, startDate, endDate, shares) {
   if (!Array.isArray(dividends) || dividends.length === 0) return { total: 0, count: 0 };
   if (!startDate || !shares || shares <= 0) return { total: 0, count: 0 };
   const end = endDate || new Date().toISOString().slice(0, 10);
@@ -6785,7 +6835,9 @@ function sumDividendsInRange(dividends, startDate, endDate, shares) {
   let count = 0;
   for (const d of dividends) {
     if (d.exDate >= startDate && d.exDate <= end) {
-      total += d.cashAmount * shares;
+      const splitFactor = cumulativeSplitFactorAfter(splits, d.exDate);
+      const adjusted = d.cashAmount / splitFactor;
+      total += adjusted * shares;
       count++;
     }
   }
@@ -6793,15 +6845,14 @@ function sumDividendsInRange(dividends, startDate, endDate, shares) {
 }
 
 // Bulk backfill: walks every position and populates dividendsCollected.
-// Caches the per-ticker dividend history within a single run so multiple
-// lots of the same ticker only trigger one API call.
+// Caches per-ticker dividend AND split history within a single run so
+// multiple lots of the same ticker only trigger one round of API calls.
 async function backfillDividends() {
   const status = document.getElementById('backfill-divs-status');
   const btn = document.getElementById('backfill-divs-btn');
   const failuresEl = document.getElementById('backfill-divs-failures');
   const failuresListEl = document.getElementById('backfill-divs-failures-list');
 
-  // Re-read polygon key from the input in case the user just pasted it.
   const keyInput = document.getElementById('polygon-key-input');
   if (keyInput && keyInput.value.trim()) polygonKey = keyInput.value.trim();
   if (!polygonKey) await loadPolygonKey();
@@ -6818,8 +6869,7 @@ async function backfillDividends() {
     return;
   }
 
-  // Build per-ticker work list. Group positions by ticker so we fetch each
-  // ticker's history only once even if multiple lots exist.
+  // Group positions by ticker — one ticker, one pair of API calls.
   const tickerToLots = new Map();
   for (const pos of positions) {
     if (!pos.ticker || !pos.dateBought) continue;
@@ -6840,13 +6890,13 @@ async function backfillDividends() {
 
   if (btn) { btn.disabled = true; btn.textContent = '⟳ Fetching dividends…'; }
   if (status) {
-    status.textContent = `Fetching dividend history for ${tickerToLots.size} tickers (Polygon free-tier rate limit — ~10s per ticker)...`;
+    status.textContent = `Fetching dividend + split history for ${tickerToLots.size} tickers (Polygon rate limit)…`;
     status.style.color = '#fbbf24';
   }
 
   const tickers = Array.from(tickerToLots.keys());
   const batchSize = 2;
-  const waitMs = 25000; // mirrors other Polygon backfills
+  const waitMs = 25000;
 
   let lotsUpdated = 0;
   const failed = [];
@@ -6854,22 +6904,36 @@ async function backfillDividends() {
 
   for (let i = 0; i < tickers.length; i += batchSize) {
     const batchTickers = tickers.slice(i, i + batchSize);
+    // For each ticker in the batch, fire dividends + splits in parallel.
     const batchResults = await Promise.all(
-      batchTickers.map(t => fetchDividendHistory(t).then(r => ({ ticker: t, ...r })))
+      batchTickers.map(async t => {
+        const [divResult, splitResult] = await Promise.all([
+          fetchDividendHistory(t),
+          fetchSplitHistory(t)
+        ]);
+        return { ticker: t, divResult, splitResult };
+      })
     );
 
     for (const result of batchResults) {
       const lots = tickerToLots.get(result.ticker);
-      if (result.error) {
-        // Mark every lot of this ticker as failed.
-        for (const lot of lots) failed.push({ ticker: result.ticker, id: lot.id, reason: result.error });
+      // If dividends failed, the ticker is unusable — flag and move on.
+      if (result.divResult.error) {
+        for (const lot of lots) failed.push({ ticker: result.ticker, id: lot.id, reason: `divs: ${result.divResult.error}` });
         continue;
       }
-      // Apply dividend math to each lot of this ticker.
+      // Splits failure is non-fatal: we proceed without split adjustment but
+      // flag a warning. For tickers that haven't split, splits=[] which is
+      // also fine. So only warn if splits explicitly errored.
+      let splitsForLot = result.splitResult.error ? [] : (result.splitResult.splits || []);
+      if (result.splitResult.error) {
+        console.warn(`[backfillDividends] ${result.ticker} splits fetch failed: ${result.splitResult.error}. Proceeding without split adjustment.`);
+      }
+
       for (const lot of lots) {
         const shares = parseFloat(lot.shares) || 0;
         const endDate = lot.closed ? (lot.sellDate || null) : null;
-        const sum = sumDividendsInRange(result.dividends, lot.dateBought, endDate, shares);
+        const sum = sumDividendsInRange(result.divResult.dividends, splitsForLot, lot.dateBought, endDate, shares);
         lot.dividendsCollected = sum.total;
         lot.dividendsCount = sum.count;
         lot.dividendsLastFetch = nowIso;
@@ -6908,7 +6972,6 @@ async function backfillDividends() {
   }
 
   if (failed.length > 0 && failuresEl && failuresListEl) {
-    // Group failures by ticker for cleaner display.
     const byTicker = {};
     for (const f of failed) {
       if (!byTicker[f.ticker]) byTicker[f.ticker] = f.reason;
