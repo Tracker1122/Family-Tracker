@@ -5691,11 +5691,15 @@ function evaluateListingDate(pos) {
 }
 
 // isLotFlagged(pos): true if this lot should display the warning UI.
-// Combines the check result with the user override.
+// Combines the check result with the user override. Two ways a lot ends up
+// flagged: 'predates' (Polygon detected the buy date is before listing date —
+// typical spinoff cost-basis allocation), or 'manual' (user clicked Flag in
+// the drilldown, e.g. for tickers like T that Polygon can't detect because
+// they existed continuously across the spinoff).
 function isLotFlagged(pos) {
   if (!pos) return false;
   if (pos.listingDateOverride) return false;
-  return pos.listingDateCheck === 'predates';
+  return pos.listingDateCheck === 'predates' || pos.listingDateCheck === 'manual';
 }
 
 // countFlaggedLots(posArr): how many lots in the array are currently flagged.
@@ -6050,6 +6054,17 @@ function _runDrilldownTests() {
   log(typeof ppAgg.trAlphaPp === 'number',
       'Test 27: trAlphaPp resolves to a number');
   positions = savedPositionsP6;
+
+  // ─── Batch 5 Phase 1: manual listing-date flag ───
+  // Test 28: isLotFlagged recognizes 'manual' state
+  log(isLotFlagged({ listingDateCheck: 'manual', listingDateOverride: false }) === true,
+      'Test 28: manual + no override → flagged');
+  log(isLotFlagged({ listingDateCheck: 'manual', listingDateOverride: true }) === false,
+      'Test 28: manual + override → suppressed');
+
+  // Test 29: toggleManualListingFlag function exists
+  log(typeof toggleManualListingFlag === 'function',
+      'Test 29: toggleManualListingFlag defined');
 
   console.log('%cDrilldown test suite complete.', 'color:#94a3b8;font-style:italic');
 }
@@ -8298,7 +8313,17 @@ async function checkListingDates() {
       for (const lot of lots) {
         lot.listingDate = listDate;
         lot.listingDateLastFetch = nowIso;
-        lot.listingDateCheck = evaluateListingDate(lot); // 'ok' | 'predates' | 'unknown' | null
+        const polygonResult = evaluateListingDate(lot); // 'ok' | 'predates' | 'unknown' | null
+        // Manual flags persist through Polygon re-checks UNLESS Polygon now
+        // detects 'predates' — in that case Polygon's stronger evidence wins
+        // and we upgrade the lot's check to 'predates'. (User knowledge of
+        // 'corrupted history' is a superset of Polygon's 'predates' check;
+        // upgrading to the more specific value loses no information.)
+        if (lot.listingDateCheck === 'manual' && polygonResult !== 'predates') {
+          // Keep the manual flag — don't let Polygon downgrade it to 'ok'/'unknown'
+        } else {
+          lot.listingDateCheck = polygonResult;
+        }
         lotsUpdated++;
         if (lot.listingDateCheck === 'predates' && !lot.listingDateOverride) {
           lotsFlagged++;
@@ -11483,6 +11508,43 @@ function dismissListingWarning(positionId) {
   if (typeof renderAll === 'function') renderAll();
 }
 
+// Toggle a manual listing-date flag on a lot (Batch 5 Phase 1).
+// For tickers where Polygon can't detect a corrupted cost-basis history
+// (e.g. T / AT&T — symbol existed continuously across the 2022 WBD spinoff),
+// the user can manually flag the lot. Toggle behavior:
+//   - If currently 'manual': clear it back to null + clear override (full untoggle)
+//   - Otherwise: set to 'manual' + clear override (so warning displays)
+//
+// Polygon-detected 'predates' is NOT touched by this function — those lots
+// hide the Flag button entirely (the dismiss link in the warning row is the
+// inverse for that flow). Polygon's check wins for state.
+function toggleManualListingFlag(positionId) {
+  const pos = positions.find(function(p){ return p.id === positionId; });
+  if (!pos) { console.warn('toggleManualListingFlag: position', positionId, 'not found'); return; }
+  // Defensive: refuse to alter Polygon-detected 'predates' lots. Use dismiss
+  // link in the warning row to suppress those.
+  if (pos.listingDateCheck === 'predates') {
+    console.warn('toggleManualListingFlag: refusing to touch Polygon-detected predates lot', positionId);
+    return;
+  }
+  if (pos.listingDateCheck === 'manual') {
+    // Untoggle: clear check and any prior dismiss-override.
+    pos.listingDateCheck = null;
+    pos.listingDateOverride = false;
+  } else {
+    // Toggle on: set 'manual' and clear override (otherwise a previously-
+    // dismissed flag would not visually re-appear).
+    pos.listingDateCheck = 'manual';
+    pos.listingDateOverride = false;
+  }
+  scheduleSave();
+  const ov = document.getElementById('drilldown-overlay');
+  if (ov && ov._lastDrilldownArgs) {
+    _renderDrilldownModal(ov._lastDrilldownArgs);
+  }
+  if (typeof renderAll === 'function') renderAll();
+}
+
 // ─────────────────────────────────────────────
 // TR vs S&P TR card explainer modal (Batch 4 Phase 1)
 // Renders into the existing drilldown overlay. Two sections:
@@ -11610,6 +11672,7 @@ function _renderDrilldownLotBlock(pos, d, isMultiLot, idx) {
   let h = '<div style="' + sep + '">';
 
   // Listing-date warning (Batch 3) — predates check, suppressible per-lot.
+  // Batch 5: also handles 'manual' state with branched warning text.
   // Renders BEFORE the meta line so the user sees the caveat before reading
   // the bought-date and return numbers below.
   if (isLotFlagged(pos)) {
@@ -11617,9 +11680,17 @@ function _renderDrilldownLotBlock(pos, d, isMultiLot, idx) {
     h += '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px">';
     h += '<div style="flex:1">';
     h += '<span style="font-size:13px;margin-right:4px">🚫</span>';
-    h += '<strong>' + esc(pos.ticker || '(no ticker)') + '</strong> didn\'t begin trading until <strong>' + esc(pos.listingDate || '?') + '</strong>. ';
-    h += 'This lot\'s bought-date (<strong>' + esc(pos.dateBought || '?') + '</strong>) is from a spinoff cost-basis allocation. ';
-    h += 'Returns over the "hold period" are not meaningful.';
+    if (pos.listingDateCheck === 'manual') {
+      // User manually flagged this lot (Batch 5). Different text — we don't
+      // have a Polygon listing date to cite, just the user's judgment.
+      h += '<strong>' + esc(pos.ticker || '(no ticker)') + '</strong> manually flagged as having corrupted cost-basis history. ';
+      h += 'Returns over this lot\'s "hold period" (bought <strong>' + esc(pos.dateBought || '?') + '</strong>) are not meaningful.';
+    } else {
+      // Polygon-detected predates (existing Batch 3 wording).
+      h += '<strong>' + esc(pos.ticker || '(no ticker)') + '</strong> didn\'t begin trading until <strong>' + esc(pos.listingDate || '?') + '</strong>. ';
+      h += 'This lot\'s bought-date (<strong>' + esc(pos.dateBought || '?') + '</strong>) is from a spinoff cost-basis allocation. ';
+      h += 'Returns over the "hold period" are not meaningful.';
+    }
     h += '</div>';
     h += '<a href="#" onclick="dismissListingWarning(' + pos.id + ');return false;" style="font-size:10px;color:var(--color-text-tertiary);text-decoration:underline;white-space:nowrap;flex-shrink:0" title="Suppress this warning for this lot only. Other lots of the same ticker keep their own warnings.">Dismiss warning</a>';
     h += '</div>';
@@ -11668,6 +11739,21 @@ function _renderDrilldownLotBlock(pos, d, isMultiLot, idx) {
   if (d.notes && d.notes.length > 0) {
     h += '<div style="margin-top:10px;font-size:10px;color:var(--color-text-tertiary);font-style:italic">';
     h += d.notes.map(function(n){ return '· ' + esc(n); }).join('<br>');
+    h += '</div>';
+  }
+
+  // Manual listing-date flag toggle (Batch 5 Phase 1).
+  // Hidden when Polygon already detected 'predates' — that lot has its own
+  // dismiss flow in the warning row above. Shown for null / ok / unknown
+  // (label: "Flag as corrupted history") and for 'manual' (label: "Unflag").
+  if (pos.listingDateCheck !== 'predates') {
+    const isManuallyFlagged = pos.listingDateCheck === 'manual';
+    const label = isManuallyFlagged ? 'Unflag this lot' : 'Flag as corrupted history';
+    const tooltip = isManuallyFlagged
+      ? 'Remove the manual flag from this lot. Returns will be treated as meaningful again.'
+      : 'For tickers Polygon can\'t auto-detect (e.g. T / AT&T post-WBD): mark this lot as having corrupted cost-basis history. Lights up the same warnings as Polygon-flagged predates lots.';
+    h += '<div style="margin-top:10px;text-align:right">';
+    h += '<a href="#" onclick="toggleManualListingFlag(' + pos.id + ');return false;" style="font-size:10px;color:var(--color-text-tertiary);text-decoration:underline" title="' + tooltip + '">' + label + '</a>';
     h += '</div>';
   }
 
