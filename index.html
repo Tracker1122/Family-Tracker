@@ -1052,7 +1052,7 @@
       </div>
     </div>
 
-    <!-- Auto-Tag + Tax Exposure -->
+    <!-- Auto-Tag + Tax Exposure + Data Quality -->
     <div class="section-heading">Portfolio Hygiene</div>
     <div id="hygiene-panel" style="margin-bottom:20px">
       <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end">
@@ -1061,6 +1061,12 @@
           <div style="font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px">Tag Status</div>
           <div id="autotag-status" style="font-size:13px;font-weight:700;color:var(--color-text-tertiary)">—</div>
           <div id="autotag-detail" style="font-size:9px;color:var(--color-text-tertiary);margin-top:4px"></div>
+        </div>
+        <!-- Data Quality Summary Card (Batch 5 Phase 4) -->
+        <div id="dataquality-card" style="background:var(--color-background-secondary);border:1px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);padding:10px 14px;min-width:220px" onclick="toggleDataQualityPanel()" title="Click to expand list of lots with data-quality issues (predates listing, manual flags, stale dividends, failed backfills).">
+          <div style="font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px">Data Quality</div>
+          <div id="dataquality-status" style="font-size:13px;font-weight:700;color:var(--color-text-tertiary)">—</div>
+          <div id="dataquality-detail" style="font-size:9px;color:var(--color-text-tertiary);margin-top:4px"></div>
         </div>
         <!-- Tax Exposure Summary -->
         <div style="background:var(--color-background-secondary);border:1px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);padding:10px 14px;min-width:220px" id="tax-exposure-card" onclick="showCardOverlay('tax')" style="cursor:pointer">
@@ -1087,6 +1093,8 @@
           </div>
         </div>
       </div>
+      <!-- Data Quality expandable detail panel (Batch 5 Phase 4) -->
+      <div id="dataquality-panel" style="display:none;margin-top:12px;background:var(--color-background-secondary);border:1px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);padding:14px"></div>
     </div>
 
     <!-- Cash Ledger -->
@@ -5126,6 +5134,116 @@ function renderAutoTagCard() {
   }
 }
 
+// ─────────────────────────────────────────────
+// Data Quality Summary card + expandable panel (Batch 5 Phase 4)
+//
+// renderDataQualityCard(): refreshes the summary card. Green when no issues,
+// amber/red when issues exist. Click toggles the detail panel.
+//
+// renderDataQualityPanel(): renders the per-lot detail table inside the
+// expandable panel. Only called when the panel is visible.
+//
+// toggleDataQualityPanel(): show/hide the panel. Persists the open/closed
+// state on `window._dqPanelOpen` so a renderAll() during an open session
+// keeps it open.
+// ─────────────────────────────────────────────
+function renderDataQualityCard() {
+  const statusEl = document.getElementById('dataquality-status');
+  const detailEl = document.getElementById('dataquality-detail');
+  const cardEl = document.getElementById('dataquality-card');
+  if (!statusEl || !detailEl || !cardEl) return;
+
+  const summary = summarizeDataQualityIssues(positions);
+  // Cache for the panel renderer (avoids recomputing during expand toggle).
+  window._dqSummary = summary;
+
+  if (summary.totalLotsAffected === 0) {
+    statusEl.textContent = '✓ No issues';
+    statusEl.style.color = 'var(--color-text-success)';
+    detailEl.textContent = 'All lots have clean data quality.';
+    cardEl.style.cursor = 'default';
+    cardEl.title = 'No data-quality issues detected across open or closed lots.';
+  } else {
+    // Build short summary string from byCode counts. Order: predates, manual,
+    // divs_stale, divs_failed (most-severe first).
+    const parts = [];
+    if (summary.byCode.predates) parts.push(`${summary.byCode.predates} predates`);
+    if (summary.byCode.manual) parts.push(`${summary.byCode.manual} manual`);
+    if (summary.byCode.divs_stale) parts.push(`${summary.byCode.divs_stale} stale divs`);
+    if (summary.byCode.divs_failed) parts.push(`${summary.byCode.divs_failed} div fails`);
+    statusEl.textContent = `${summary.totalLotsAffected} lot${summary.totalLotsAffected === 1 ? '' : 's'} flagged`;
+    // Color by max severity present
+    const hasRed = summary.byCode.predates || summary.byCode.manual;
+    statusEl.style.color = hasRed ? 'var(--color-text-danger)' : '#fbbf24';
+    detailEl.textContent = parts.join(' · ') + ' — click to review';
+    cardEl.style.cursor = 'pointer';
+    cardEl.title = 'Click to expand list of flagged lots.';
+  }
+
+  // If the panel is currently open, refresh its contents so any state
+  // changes (new flag, dismiss, untag) reflect immediately.
+  if (window._dqPanelOpen) {
+    renderDataQualityPanel();
+  }
+}
+
+function renderDataQualityPanel() {
+  const panel = document.getElementById('dataquality-panel');
+  if (!panel) return;
+  const summary = window._dqSummary || summarizeDataQualityIssues(positions);
+
+  if (summary.totalLotsAffected === 0) {
+    panel.innerHTML = '<div style="font-size:11px;color:var(--color-text-tertiary);text-align:center;padding:8px">No issues to review.</div>';
+    return;
+  }
+
+  // Tag colors keyed to severity
+  const tagStyle = function(severity) {
+    if (severity === 'red') return 'background:rgba(248,113,113,0.15);color:#fca5a5;border:1px solid rgba(248,113,113,0.35)';
+    return 'background:rgba(251,191,36,0.15);color:#fcd34d;border:1px solid rgba(251,191,36,0.35)';
+  };
+
+  let html = '';
+  html += '<div style="font-size:10px;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:10px">' +
+          summary.totalLotsAffected + ' lot' + (summary.totalLotsAffected === 1 ? '' : 's') + ' with data quality issues' +
+          ' <span style="float:right;font-size:9px;text-transform:none;letter-spacing:0">click any row to open drilldown</span></div>';
+  html += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:11px">';
+  html += '<thead><tr>' +
+          '<th style="text-align:left;padding:6px 8px;font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.08em;border-bottom:1px solid var(--color-border-tertiary)">Ticker</th>' +
+          '<th style="text-align:left;padding:6px 8px;font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.08em;border-bottom:1px solid var(--color-border-tertiary)">Account</th>' +
+          '<th style="text-align:left;padding:6px 8px;font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.08em;border-bottom:1px solid var(--color-border-tertiary)">Bought</th>' +
+          '<th style="text-align:left;padding:6px 8px;font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.08em;border-bottom:1px solid var(--color-border-tertiary)">Issues</th>' +
+          '</tr></thead><tbody>';
+
+  for (const entry of summary.lots) {
+    const p = entry.pos;
+    const closedNote = p.closed ? ' <span style="color:#fbbf24;font-size:9px">closed</span>' : '';
+    const tags = entry.issues.map(function(i){
+      return '<span style="display:inline-block;padding:2px 7px;border-radius:3px;font-size:9px;font-weight:700;margin-right:4px;' + tagStyle(i.severity) + '">' + esc(i.label) + '</span>';
+    }).join('');
+    html += '<tr style="cursor:pointer" onclick="openTickerDrilldown(' + jsAttrStr(p.ticker || '') + ',' + jsAttrStr(p.account || null) + ')">' +
+            '<td style="padding:6px 8px;border-bottom:1px solid var(--color-border-tertiary);font-weight:700">' + esc(p.ticker || '—') + closedNote + '</td>' +
+            '<td style="padding:6px 8px;border-bottom:1px solid var(--color-border-tertiary);color:var(--color-text-secondary)">' + esc(p.account || '—') + '</td>' +
+            '<td style="padding:6px 8px;border-bottom:1px solid var(--color-border-tertiary);color:var(--color-text-secondary)">' + esc(p.dateBought || '—') + '</td>' +
+            '<td style="padding:6px 8px;border-bottom:1px solid var(--color-border-tertiary)">' + tags + '</td>' +
+            '</tr>';
+  }
+
+  html += '</tbody></table></div>';
+  panel.innerHTML = html;
+}
+
+function toggleDataQualityPanel() {
+  const panel = document.getElementById('dataquality-panel');
+  const summary = window._dqSummary || summarizeDataQualityIssues(positions);
+  // Only allow toggle when there are actually issues to show
+  if (!panel || summary.totalLotsAffected === 0) return;
+  const willOpen = panel.style.display === 'none';
+  panel.style.display = willOpen ? 'block' : 'none';
+  window._dqPanelOpen = willOpen;
+  if (willOpen) renderDataQualityPanel();
+}
+
 function flashSave() {
   const note = document.getElementById('save-note');
   const inline = document.getElementById('save-note-inline');
@@ -5815,6 +5933,61 @@ function hasFlaggedLot(posArr) {
     if (isLotFlagged(p)) return true;
   }
   return false;
+}
+
+// classifyLotDataQuality(pos): returns array of issue tag objects for a lot.
+// Used by the Data Quality Summary panel (Tier 1 #1 — Batch 5 Phase 4).
+//
+// Returns an array of { code, label, severity } where:
+//   code: 'predates' | 'manual' | 'divs_stale' | 'divs_failed'
+//   label: short user-facing string for the tag
+//   severity: 'red' (math is wrong) | 'amber' (math under-stated)
+//
+// Empty array means the lot has no known data-quality issues.
+//
+// Does NOT include "missing benchmark price" by design — this is expected
+// for older lots on Polygon's free tier and would swamp legitimate issues.
+//
+// Override-suppressed flags (`listingDateOverride === true`) ARE still
+// included here. The summary panel's purpose is to surface every known
+// concern; if a user dismissed a warning they can re-evaluate it here.
+function classifyLotDataQuality(pos) {
+  if (!pos) return [];
+  const issues = [];
+  if (pos.listingDateCheck === 'predates') {
+    issues.push({ code: 'predates', label: 'Predates listing', severity: 'red' });
+  } else if (pos.listingDateCheck === 'manual') {
+    issues.push({ code: 'manual', label: 'Manually flagged', severity: 'red' });
+  }
+  if (pos.dividendsDataStale) {
+    issues.push({ code: 'divs_stale', label: 'Stale dividends', severity: 'amber' });
+  }
+  if (pos.dividendsFetchOk === false) {
+    issues.push({ code: 'divs_failed', label: 'Div backfill failed', severity: 'amber' });
+  }
+  return issues;
+}
+
+// summarizeDataQualityIssues(positions): returns
+//   { totalLotsAffected, byCode: { predates: N, manual: N, ... }, lots: [...] }
+// where lots is the per-lot detail sorted by issue count desc then ticker asc.
+function summarizeDataQualityIssues(posArr) {
+  const out = { totalLotsAffected: 0, byCode: {}, lots: [] };
+  if (!Array.isArray(posArr)) return out;
+  for (const p of posArr) {
+    const issues = classifyLotDataQuality(p);
+    if (issues.length === 0) continue;
+    out.totalLotsAffected++;
+    for (const i of issues) {
+      out.byCode[i.code] = (out.byCode[i.code] || 0) + 1;
+    }
+    out.lots.push({ pos: p, issues });
+  }
+  out.lots.sort(function(a, b){
+    if (b.issues.length !== a.issues.length) return b.issues.length - a.issues.length;
+    return (a.pos.ticker || '').localeCompare(b.pos.ticker || '');
+  });
+  return out;
 }
 
 // tickerHasFlaggedLot(ticker, accountFilter): row-badge predicate.
@@ -12984,6 +13157,7 @@ function renderAll() {
   renderCapitalFlow();
   renderTaxExposure();
   renderAutoTagCard();
+  renderDataQualityCard();
   renderStaleBanner();
   updateBackfillButton();
   updateIndustryAlphaToggleVisual();
