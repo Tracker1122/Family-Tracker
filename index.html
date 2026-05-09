@@ -5990,6 +5990,56 @@ function summarizeDataQualityIssues(posArr) {
   return out;
 }
 
+// summarizeTrCardDataQuality(posArr): per-category breakdown for the TR vs
+// S&P TR card footnote (Batch 5 Phase 5). Returns 5 categories — a lot can
+// appear in multiple. Closed lots ignored (footnote is open-positions only).
+//
+// Categories:
+//   predates           — Polygon-detected listing-date issue (red)
+//   manual             — user-flagged (red)
+//   divs_stale         — Polygon data gap, Batch 5 Phase 3 flag (amber)
+//   divs_failed        — backfill attempted and errored (amber)
+//   divs_unbackfilled  — never attempted; has shares but lastFetch null (amber)
+//
+// Per category: { count, costBasis, tickers (Set) }
+//
+// A lot's cost basis = shares × pricePaid. Used to size the data quality
+// gap, not to claim the alpha is wrong by that amount.
+function summarizeTrCardDataQuality(posArr) {
+  const cats = {
+    predates:          { count: 0, costBasis: 0, tickers: new Set(), label: 'flagged predates' },
+    manual:            { count: 0, costBasis: 0, tickers: new Set(), label: 'manually flagged' },
+    divs_stale:        { count: 0, costBasis: 0, tickers: new Set(), label: 'with stale divs' },
+    divs_failed:       { count: 0, costBasis: 0, tickers: new Set(), label: 'with div fetch failed' },
+    divs_unbackfilled: { count: 0, costBasis: 0, tickers: new Set(), label: 'with no div backfill' },
+  };
+  if (!Array.isArray(posArr)) return cats;
+  for (const p of posArr) {
+    const shares = parseFloat(p.shares) || 0;
+    const cb = shares * (parseFloat(p.pricePaid) || 0);
+    const tk = p.ticker || '?';
+    if (p.listingDateCheck === 'predates') {
+      cats.predates.count++; cats.predates.costBasis += cb; cats.predates.tickers.add(tk);
+    } else if (p.listingDateCheck === 'manual') {
+      cats.manual.count++; cats.manual.costBasis += cb; cats.manual.tickers.add(tk);
+    }
+    if (p.dividendsDataStale) {
+      cats.divs_stale.count++; cats.divs_stale.costBasis += cb; cats.divs_stale.tickers.add(tk);
+    }
+    if (p.dividendsFetchOk === false) {
+      cats.divs_failed.count++; cats.divs_failed.costBasis += cb; cats.divs_failed.tickers.add(tk);
+    }
+    // Never-attempted: has shares, no lastFetch, AND fetchOk wasn't set false
+    // (else it'd be in divs_failed). null OR undefined means "no attempt yet".
+    if (shares > 0 && (p.dividendsLastFetch === null || p.dividendsLastFetch === undefined) && p.dividendsFetchOk !== false) {
+      cats.divs_unbackfilled.count++;
+      cats.divs_unbackfilled.costBasis += cb;
+      cats.divs_unbackfilled.tickers.add(tk);
+    }
+  }
+  return cats;
+}
+
 // tickerHasFlaggedLot(ticker, accountFilter): row-badge predicate.
 // Mirrors the lot-selection logic of openTickerDrilldown so the badge
 // matches what the drilldown will show when clicked. accountFilter null
@@ -6395,15 +6445,53 @@ function renderSummary(containerId, posArr, isOpen) {
     ? `<div style="font-size:8px;color:#fbbf24;font-style:italic;margin-top:2px" title="No lots have been div-backfilled. Click ⟳ Backfill Dividends in the header.">divs not backfilled</div>`
     : '';
 
-  // Listing-date flagged-lots note (Batch 3) — only shown on open-positions
-  // strip. Cards still compute including flagged lots; this is informational.
-  // Batch 4: hover tooltip removed — full explanation lives in the click-modal
-  // on the TR vs S&P TR card itself. Wording updated: "click card for details"
-  // (whole card is clickable, not just this line, but click anywhere works).
-  const flaggedCount = isOpen ? countFlaggedLots(posArr) : 0;
-  const flaggedNote = flaggedCount > 0
-    ? `<div style="font-size:8px;color:#fbbf24;font-style:italic;margin-top:2px">${flaggedCount} lot${flaggedCount===1?'':'s'} flagged — click card for details</div>`
-    : '';
+  // TR vs S&P TR card data-quality footnote (Batch 5 Phase 5)
+  // Per-category breakdown of which lots affect this card's accuracy.
+  // Categories — a lot can appear in multiple if it has multiple issues:
+  //   1. predates (Polygon-detected spinoff cost basis) — wrong S&P TR period
+  //   2. manual (user-flagged) — same effect, user judgment
+  //   3. divs_stale (Polygon data gap, e.g. BF.B post-2010) — under-states YOUR TR
+  //   4. divs_failed (backfill attempted, errored) — same effect
+  //   5. divs_unbackfilled (never attempted) — silently treats divs as $0
+  //
+  // Format per line: "* N lots <reason> ($Xk · TICKER1, TICKER2)"
+  // Hide categories with zero affected lots. Show "✓ Clean" if zero issues
+  // across all 5 categories. Open-positions strip only.
+  let trDataQualityNote = '';
+  if (isOpen) {
+    const cats = summarizeTrCardDataQuality(posArr);
+
+    // Compact dollar formatter for cost basis: $1.2M, $542k, $750
+    const fmtCompactDollar = function(v) {
+      const abs = Math.abs(v);
+      if (abs >= 1e6) return '$' + (v/1e6).toFixed(1) + 'M';
+      if (abs >= 1e3) return '$' + Math.round(v/1e3) + 'k';
+      return '$' + Math.round(v);
+    };
+    // Truncate ticker list at 4 with "…" if more
+    const fmtTickerList = function(s) {
+      const arr = [...s].sort();
+      if (arr.length <= 4) return arr.join(', ');
+      return arr.slice(0,4).join(', ') + '…';
+    };
+
+    const lines = [];
+    const order = ['predates','manual','divs_stale','divs_failed','divs_unbackfilled'];
+    for (const code of order) {
+      const c = cats[code];
+      if (c.count === 0) continue;
+      lines.push(
+        `<div style="font-size:8px;color:#fbbf24;font-style:italic;margin-top:2px;line-height:1.35">* ${c.count} lot${c.count===1?'':'s'} ${c.label} (${fmtCompactDollar(c.costBasis)} · ${fmtTickerList(c.tickers)})</div>`
+      );
+    }
+
+    if (lines.length === 0) {
+      trDataQualityNote = `<div style="font-size:8px;color:var(--color-text-success);font-style:italic;margin-top:2px">✓ Clean</div>`;
+    } else {
+      trDataQualityNote = lines.join('') +
+        `<div style="font-size:8px;color:var(--color-text-tertiary);margin-top:3px">click card for details</div>`;
+    }
+  }
 
   el.innerHTML = `
     <div class="summary-card">
@@ -6451,7 +6539,7 @@ function renderSummary(containerId, posArr, isOpen) {
     ${isOpen ? `<div class="summary-card summary-card-clickable" onclick="openTrCardExplainer()">
       <div class="summary-card-label">TR vs S&P TR</div>
       <div class="summary-card-value ${colorClass(tr.gapTrPp)}">${fmtPp(tr.gapTrPp)}</div>
-      ${flaggedNote}
+      ${trDataQualityNote}
     </div>` : ''}
     ${isOpen ? `<div class="summary-card" title="Total dividends collected across all open lots where backfill succeeded. ${tr && tr.coverage === 'partial' ? `Excludes ${tr.lotsMissingDivs} unfetched lot${tr.lotsMissingDivs===1?'':'s'}.` : ''}">
       <div class="summary-card-label">Total Divs</div>
