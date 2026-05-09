@@ -808,7 +808,7 @@
   <div style="display:flex;align-items:center;gap:8px;margin-left:auto">
     <button id="refresh-prices-btn" class="btn btn-sm btn-primary" onclick="refreshAllPrices()" style="font-size:10px;padding:4px 12px">⟳ Refresh Prices</button>
     <button id="get-benchmarks-btn" class="btn btn-sm" onclick="getBenchmarkPrices()" style="font-size:10px;padding:4px 12px" title="Fetches benchmark ETF prices (QQQ, SMH, CIBR, XLF, XLE, GLD, XLY, ITA, SPHQ) — needed for snapshots and benchmark display">⟳ Get Benchmarks</button>
-    <button id="backfill-btn" class="btn btn-sm" onclick="backfillThemeBenchmarks()" style="font-size:10px;padding:4px 12px" title="One-time historical fetch of benchmark prices on each position's buy/sell dates. Enables theme-relative alpha math.">⟳ Backfill Theme Benchmarks</button>
+    <button id="backfill-btn" class="btn btn-sm" onclick="backfillThemeBenchmarks()" style="font-size:10px;padding:4px 12px" title="One-time historical fetch of benchmark prices on each position's buy/sell dates. Enables industry-relative alpha math.">⟳ Backfill Industry Benchmarks</button>
     <button id="backfill-spx-btn" class="btn btn-sm" onclick="backfillSpxAtBuy()" style="font-size:10px;padding:4px 12px" title="Fills the S&P Buy / S&P Exit columns where blank, using the calendar-nearest monthly snapshot from a baked-in S&P history table (1988→present). Granularity is monthly — accurate enough for return comparisons over multi-month/year holds, less precise for short holds in volatile months. No network call.">⟳ Backfill S&amp;P (monthly approx)</button>
     <button id="backfill-divs-btn" class="btn btn-sm" onclick="backfillDividends()" style="font-size:10px;padding:4px 12px" title="Fetches each ticker's dividend history from Polygon and computes total dividends collected per lot (cash_amount × shares, summed since buy date). One API call per unique ticker. Free tier rate limit means ~10 minutes for 50 positions.">⟳ Backfill Dividends</button>
     <button id="listing-check-btn" class="btn btn-sm" onclick="checkListingDates()" style="font-size:10px;padding:4px 12px" title="Fetches each ticker's listing date from Polygon and flags lots whose buy date predates the listing (typically spinoff cost-basis allocations like GE → GEHC). Informational only — does NOT change any return math. One API call per unique ticker; ~13 seconds each due to rate limits.">⟳ Check Listings</button>
@@ -953,7 +953,7 @@
 
     <!-- Industry Spotlight -->
     <div class="section-heading">Industry Spotlight <span style="font-size:9px;color:var(--color-text-tertiary);font-weight:400;text-transform:none;letter-spacing:0">— signals worth acting on · click to expand in Rebalance & Tax</span>
-      <span style="margin-left:16px;font-weight:400;text-transform:none;letter-spacing:0" title="Filter theme alpha aggregates to positions held ≥180 days. Affects both Industry Intelligence and Industry Spotlight.">
+      <span style="margin-left:16px;font-weight:400;text-transform:none;letter-spacing:0" title="Filter industry alpha aggregates to positions held ≥180 days. Affects both Industry Intelligence and Industry Spotlight.">
         <span id="indalpha-toggle-all-dash" onclick="toggleIndustryAlphaMature(false)" style="font-size:9px;cursor:pointer;padding:2px 8px;border-radius:10px;color:var(--color-text-tertiary);font-weight:400">All Open</span>
         <span id="indalpha-toggle-mature-dash" onclick="toggleIndustryAlphaMature(true)" style="font-size:9px;cursor:pointer;padding:2px 8px;border-radius:10px;color:var(--color-text-tertiary);font-weight:400">Matured (≥180d)</span>
       </span>
@@ -961,7 +961,7 @@
     <div style="margin:6px 0 12px;padding:10px 14px;background:var(--color-background-secondary);border-left:3px solid var(--color-text-info);border-radius:var(--border-radius-sm);font-size:11px;color:var(--color-text-secondary);line-height:1.55">
       <div style="display:flex;align-items:center;gap:6px;margin-bottom:5px"><span style="font-size:13px;color:var(--color-text-info)">ⓘ</span><span style="font-weight:700;color:var(--color-text-primary);text-transform:uppercase;letter-spacing:0.05em;font-size:10px">Two pp methods, two different questions</span></div>
       <div><strong style="color:var(--color-text-primary)">Industry-level pp</strong> (shown on Spotlight cards and Industry Reference headers) is <strong>capital-weighted across positions</strong> — total $ deficit ÷ total invested. It answers: "how much pp alpha did the capital deployed in this whole industry produce?"</div>
-      <div style="margin-top:4px"><strong style="color:var(--color-text-primary)">Per-position pp</strong> (shown in drill-downs and Strategy Reference rows) is just the position's actual deviation from its theme benchmark. It answers: "how is this single ticker performing vs its theme?"</div>
+      <div style="margin-top:4px"><strong style="color:var(--color-text-primary)">Per-position pp</strong> (shown in drill-downs and Strategy Reference rows) is just the position's actual deviation from its industry benchmark. It answers: "how is this single ticker performing vs its industry?"</div>
       <div id="legend-example-spotlight" style="margin-top:6px;padding:7px 10px;background:var(--color-background-tertiary);border-radius:var(--border-radius-sm);font-size:10px"></div>
     </div>
     <div id="dashboard-theme-spotlight" style="margin-bottom:20px"></div>
@@ -969,7 +969,7 @@
     <!-- Strategy Reference -->
     <div class="section-heading">Strategy Reference</div>
     <div style="margin:6px 0 8px;padding:8px 14px;background:var(--color-background-secondary);border-left:3px solid var(--color-text-info);border-radius:var(--border-radius-sm);font-size:11px;color:var(--color-text-secondary);line-height:1.55">
-      <span style="font-size:13px;color:var(--color-text-info);margin-right:6px">ⓘ</span><strong style="color:var(--color-text-primary)">Per-position pp</strong> — pp values shown in this panel are position-specific (this ticker's return minus its theme benchmark over the holding period). They are <strong>not</strong> capital-weighted across the industry. For industry-aggregate capital-weighted pp, see Industry Reference below or click any Industry Spotlight card.
+      <span style="font-size:13px;color:var(--color-text-info);margin-right:6px">ⓘ</span><strong style="color:var(--color-text-primary)">Per-position pp</strong> — pp values shown in this panel are position-specific (this ticker's return minus its industry benchmark over the holding period). They are <strong>not</strong> capital-weighted across the industry. For industry-aggregate capital-weighted pp, see Industry Reference below or click any Industry Spotlight card.
     </div>
     <div id="sleeve-ref-panel" style="margin:8px 0 12px" onclick="showCardOverlay('stratref')" style="cursor:pointer"></div>
 
@@ -1052,53 +1052,15 @@
       </div>
     </div>
 
-    <!-- Cash Buckets -->
-    <div class="section-heading">Undeployed Cash</div>
-    <div id="cash-panel" style="margin-bottom:20px">
+    <!-- Auto-Tag + Tax Exposure -->
+    <div class="section-heading">Portfolio Hygiene</div>
+    <div id="hygiene-panel" style="margin-bottom:20px">
       <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end">
-        <div style="background:var(--color-background-secondary);border:1px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);padding:10px 14px;min-width:160px" onclick="showCardOverlay('cash')" style="cursor:pointer">
-          <div style="font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px">Taxable Cash</div>
-          <div style="display:flex;align-items:center;gap:8px">
-            <span id="cash-taxable-display" style="font-size:16px;font-weight:700;color:var(--color-text-primary)">$0</span>
-            <button class="btn btn-sm" onclick="adjustCash('Taxable')" style="font-size:9px;padding:2px 6px">± Adjust</button>
-          </div>
-        </div>
-        <div style="background:var(--color-background-secondary);border:1px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);padding:10px 14px;min-width:160px">
-          <div style="font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px">IRA Cash</div>
-          <div style="display:flex;align-items:center;gap:8px">
-            <span id="cash-ira-display" style="font-size:16px;font-weight:700;color:var(--color-text-primary)">$0</span>
-            <button class="btn btn-sm" onclick="adjustCash('IRA')" style="font-size:9px;padding:2px 6px">± Adjust</button>
-          </div>
-        </div>
-        <div id="cash-adjust-inline" style="display:none;background:var(--color-background-tertiary);border:1px solid var(--color-border-secondary);border-radius:var(--border-radius-md);padding:10px 14px">
-          <div style="font-size:9px;color:var(--color-text-tertiary);margin-bottom:6px" id="cash-adjust-label">Adjust Taxable Cash</div>
-          <div style="display:flex;gap:8px;align-items:center">
-            <input id="cash-adjust-input" class="modal-input" type="number" step="0.01" placeholder="Amount (use - to subtract)" style="width:160px">
-            <button class="btn btn-sm btn-primary" onclick="confirmAdjustCash()">Apply</button>
-            <button class="btn btn-sm" onclick="closeAdjustCash()">Cancel</button>
-          </div>
-        </div>
-        <!-- Capital Flow Summary -->
-        <div style="background:var(--color-background-secondary);border:1px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);padding:10px 14px;min-width:220px" id="capital-flow-card" onclick="showCardOverlay('capitalflow')" style="cursor:pointer">
-          <div style="font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px">Capital Flow</div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px">
-            <div>
-              <div style="font-size:9px;color:var(--color-text-tertiary)">Rotated</div>
-              <div id="flow-rotated" style="font-size:13px;font-weight:700;color:var(--color-text-info)">$0</div>
-            </div>
-            <div>
-              <div style="font-size:9px;color:var(--color-text-tertiary)">→ Index</div>
-              <div id="flow-indexed" style="font-size:13px;font-weight:700;color:#fbbf24">$0</div>
-            </div>
-            <div>
-              <div style="font-size:9px;color:var(--color-text-tertiary)">Pulled Out</div>
-              <div id="flow-out" style="font-size:13px;font-weight:700;color:var(--color-text-danger)">$0</div>
-            </div>
-            <div>
-              <div style="font-size:9px;color:var(--color-text-tertiary)">Net Flow</div>
-              <div id="flow-net" style="font-size:13px;font-weight:700;color:var(--color-text-primary)">$0</div>
-            </div>
-          </div>
+        <!-- Auto-Tag Card (Batch 5 Phase 2) -->
+        <div id="autotag-card" style="background:var(--color-background-secondary);border:1px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);padding:10px 14px;min-width:220px;cursor:pointer" onclick="autoTagUntaggedPositions()" title="Click to auto-fill industry and strategy on lots that are missing one or both. Uses a baked-in lookup table for known tickers. Unknown tickers are skipped.">
+          <div style="font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px">Tag Status</div>
+          <div id="autotag-status" style="font-size:13px;font-weight:700;color:var(--color-text-tertiary)">—</div>
+          <div id="autotag-detail" style="font-size:9px;color:var(--color-text-tertiary);margin-top:4px"></div>
         </div>
         <!-- Tax Exposure Summary -->
         <div style="background:var(--color-background-secondary);border:1px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);padding:10px 14px;min-width:220px" id="tax-exposure-card" onclick="showCardOverlay('tax')" style="cursor:pointer">
@@ -1174,7 +1136,7 @@
             <th class="r">Your Ret %</th>
             <th class="r">S&P Ret %</th>
             <th class="r">vs S&P (pp)</th>
-            <th class="r" title="Theme-relative alpha — your return minus theme benchmark return over the same holding period. Honest comparison for sleeves with theme benchmarks (Thesis Plays, Quality with mapped industries).">Theme α (pp)</th>
+            <th class="r" title="Industry-relative alpha — your return minus industry benchmark return over the same holding period. Honest comparison for sleeves with industry benchmarks (Thesis Plays, Quality with mapped industries).">Industry α (pp)</th>
             <th>Result</th>
             <th>Status</th>
             <th>Industry</th>
@@ -1217,7 +1179,7 @@
             <th class="r">S&P Ret %</th>
             <th class="r">vs S&P (pp)</th>
             <th class="r" title="TR vs S&P TR — your Total Return % minus S&P 500 Total Return % over this lot's hold period (buy → sell). Includes dividends on both sides. Lots without div backfill count divs as $0, under-stating this number. Small line below shows the dollar version.">TR vs S&P TR</th>
-            <th class="r" title="Theme-relative alpha — your return minus theme benchmark return over the holding period (buy date to sell date).">Theme α (pp)</th>
+            <th class="r" title="Industry-relative alpha — your return minus industry benchmark return over the holding period (buy date to sell date).">Industry α (pp)</th>
             <th>Result</th>
             <th>Status</th>
             <th>Industry</th>
@@ -1244,7 +1206,7 @@
         <span id="conc-toggle-sleeve" onclick="setConcMode('sleeve')" style="font-size:9px;cursor:pointer;padding:2px 8px;border-radius:10px;background:var(--color-text-info);color:#000;font-weight:600">% of Strategy</span>
         <span id="conc-toggle-total" onclick="setConcMode('total')" style="font-size:9px;cursor:pointer;padding:2px 8px;border-radius:10px;color:var(--color-text-tertiary);font-weight:400">% of Total</span>
       </span>
-      <span style="margin-left:16px;font-weight:400;text-transform:none;letter-spacing:0" title="Filter theme alpha aggregates to positions held ≥180 days. Affects both Industry Intelligence and Industry Spotlight.">
+      <span style="margin-left:16px;font-weight:400;text-transform:none;letter-spacing:0" title="Filter industry alpha aggregates to positions held ≥180 days. Affects both Industry Intelligence and Industry Spotlight.">
         <span id="indalpha-toggle-all-rebal" onclick="toggleIndustryAlphaMature(false)" style="font-size:9px;cursor:pointer;padding:2px 8px;border-radius:10px;color:var(--color-text-tertiary);font-weight:400">All Open</span>
         <span id="indalpha-toggle-mature-rebal" onclick="toggleIndustryAlphaMature(true)" style="font-size:9px;cursor:pointer;padding:2px 8px;border-radius:10px;color:var(--color-text-tertiary);font-weight:400">Matured (≥180d)</span>
       </span>
@@ -1273,7 +1235,7 @@
             <th class="r">Industry %</th>
             <th onclick="sortRebal('dollarAlpha')" class="sortable r">Dollar Alpha <span id="sort-dollarAlpha"></span></th>
             <th onclick="sortRebal('trAlpha')" class="sortable r" title="Dollar TR alpha — includes dividends on both sides (yours + S&amp;P TR). Lots without div backfill count divs as $0, under-stating this number.">TR α <span id="sort-trAlpha"></span></th>
-            <th onclick="sortRebal('themeAlpha')" class="sortable r" title="Theme-relative alpha — your dollar gain vs theme benchmark over the same period. More honest comparison for sleeves with assigned theme benchmarks.">Theme α <span id="sort-themeAlpha"></span></th>
+            <th onclick="sortRebal('themeAlpha')" class="sortable r" title="Industry-relative alpha — your dollar gain vs industry benchmark over the same period. More honest comparison for sleeves with assigned industry benchmarks.">Industry α <span id="sort-themeAlpha"></span></th>
             <th onclick="sortRebal('gl')" class="sortable r">Unreal. G/L <span id="sort-gl"></span></th>
             <th>Signal</th>
           </tr>
@@ -5032,6 +4994,113 @@ function migratePositionsListingFields() {
   }
 }
 
+// ─────────────────────────────────────────────
+// Auto-tag untagged positions (Batch 5 Phase 2)
+//
+// countUntaggedPositions(): how many open positions are missing either
+// theme (industry) or sleeve (strategy). Closed positions are counted too
+// — historical analysis benefits from tagged closed lots.
+//
+// autoTagUntaggedPositions(): walks all positions, fills missing theme
+// and/or sleeve from TICKER_DEFAULT_TAGS for known tickers. Already-set
+// fields are never overwritten. Returns counts for the toast.
+//
+// renderAutoTagCard(): refreshes the dashboard card showing tag status.
+// Green when 0 untagged, red+actionable when >0.
+// ─────────────────────────────────────────────
+function countUntaggedPositions() {
+  let untagged = 0;
+  for (const p of positions) {
+    if (!p.theme || !p.sleeve) untagged++;
+  }
+  return untagged;
+}
+
+function autoTagUntaggedPositions() {
+  let tagged = 0;
+  let unknownTickers = new Set();
+  let positionsTouched = 0;
+
+  for (const p of positions) {
+    // Skip lots that are fully tagged
+    if (p.theme && p.sleeve) continue;
+
+    const ticker = (p.ticker || '').trim().toUpperCase();
+    const defaults = TICKER_DEFAULT_TAGS[ticker];
+
+    if (!defaults) {
+      // Unknown ticker — skip, but record for the toast
+      if (ticker) unknownTickers.add(ticker);
+      continue;
+    }
+
+    // Fill only missing fields (per Batch 5 Phase 2 spec).
+    let touched = false;
+    if (!p.theme) { p.theme = defaults.industry; touched = true; tagged++; }
+    if (!p.sleeve) { p.sleeve = defaults.strategy; touched = true; tagged++; }
+    if (touched) positionsTouched++;
+  }
+
+  // Toast / inline status feedback. Use the same flashSave pattern as the
+  // existing save indicator — simple, consistent.
+  if (positionsTouched === 0) {
+    if (unknownTickers.size > 0) {
+      console.log(`Auto-tag: nothing to tag. ${unknownTickers.size} unknown ticker(s) skipped: ${[...unknownTickers].sort().join(', ')}`);
+    } else {
+      console.log('Auto-tag: nothing to tag.');
+    }
+  } else {
+    console.log(`Auto-tag: ${tagged} field(s) filled across ${positionsTouched} position(s).` +
+      (unknownTickers.size > 0 ? ` ${unknownTickers.size} unknown ticker(s) skipped: ${[...unknownTickers].sort().join(', ')}` : ''));
+  }
+
+  scheduleSave();
+  if (typeof renderAll === 'function') renderAll();
+
+  return { tagged, positionsTouched, unknownTickers: [...unknownTickers] };
+}
+
+function renderAutoTagCard() {
+  const statusEl = document.getElementById('autotag-status');
+  const detailEl = document.getElementById('autotag-detail');
+  const cardEl = document.getElementById('autotag-card');
+  if (!statusEl || !detailEl || !cardEl) return;
+
+  const untagged = countUntaggedPositions();
+
+  if (untagged === 0) {
+    statusEl.textContent = '✓ All lots tagged';
+    statusEl.style.color = 'var(--color-text-success)';
+    detailEl.textContent = 'Nice. No tagging work pending.';
+    cardEl.style.cursor = 'default';
+    cardEl.title = 'All open and closed lots have both industry and strategy tags.';
+  } else {
+    // Count how many have a known default available
+    let autoEligible = 0;
+    let unknownTickers = new Set();
+    for (const p of positions) {
+      if (p.theme && p.sleeve) continue;
+      const ticker = (p.ticker || '').trim().toUpperCase();
+      if (TICKER_DEFAULT_TAGS[ticker]) autoEligible++;
+      else if (ticker) unknownTickers.add(ticker);
+    }
+
+    statusEl.textContent = `${untagged} lot${untagged === 1 ? '' : 's'} need tagging`;
+    statusEl.style.color = 'var(--color-text-danger)';
+    if (autoEligible > 0 && unknownTickers.size === 0) {
+      detailEl.textContent = `Click to auto-tag ${autoEligible} lot${autoEligible === 1 ? '' : 's'}`;
+    } else if (autoEligible > 0 && unknownTickers.size > 0) {
+      detailEl.textContent = `Click to auto-tag ${autoEligible}. ${unknownTickers.size} unknown ticker${unknownTickers.size === 1 ? '' : 's'} (manual): ${[...unknownTickers].sort().slice(0, 3).join(', ')}${unknownTickers.size > 3 ? '…' : ''}`;
+    } else {
+      detailEl.textContent = `${unknownTickers.size} unknown ticker${unknownTickers.size === 1 ? '' : 's'} — tag manually: ${[...unknownTickers].sort().slice(0, 3).join(', ')}${unknownTickers.size > 3 ? '…' : ''}`;
+    }
+    cardEl.style.cursor = autoEligible > 0 ? 'pointer' : 'default';
+    cardEl.title = autoEligible > 0
+      ? 'Click to auto-fill industry and strategy on lots with known tickers.'
+      : 'No auto-fillable tickers in untagged set. Tag these lots manually via the Position table dropdowns.';
+  }
+}
+
 function flashSave() {
   const note = document.getElementById('save-note');
   const inline = document.getElementById('save-note-inline');
@@ -6393,8 +6462,8 @@ function renderTrackRecordCards() {
         <div class="summary-card-label">Beat S&P %</div>
         <div class="summary-card-value" style="color:var(--color-text-tertiary)">${emptyMsg}</div>
       </div>
-      <div class="summary-card" title="Percentage of closed positions that beat their theme benchmark.">
-        <div class="summary-card-label">Beat Theme %</div>
+      <div class="summary-card" title="Percentage of closed positions that beat their industry benchmark.">
+        <div class="summary-card-label">Beat Industry %</div>
         <div class="summary-card-value" style="color:var(--color-text-tertiary)">${emptyMsg}</div>
       </div>
       <div class="summary-card" title="Average dollar gain on winning closes vs average dollar loss on losing closes.">
@@ -6481,10 +6550,10 @@ function renderTrackRecordCards() {
   let beatThemeCard;
   if (!t.beatTheme || t.beatTheme.pct === null) {
     beatThemeCard = `
-      <div class="summary-card" title="Percentage of closed positions that beat their theme benchmark over the holding period. Requires mapped themes and backfilled benchmark prices on buy and sell dates.">
-        <div class="summary-card-label">Beat Theme %</div>
+      <div class="summary-card" title="Percentage of closed positions that beat their industry benchmark over the holding period. Requires mapped industries and backfilled benchmark prices on buy and sell dates.">
+        <div class="summary-card-label">Beat Industry %</div>
         <div class="summary-card-value" style="color:var(--color-text-tertiary)">—</div>
-        <div style="font-size:9px;color:var(--color-text-tertiary);margin-top:2px">no theme data yet</div>
+        <div style="font-size:9px;color:var(--color-text-tertiary);margin-top:2px">no industry data yet</div>
       </div>
     `;
   } else {
@@ -6493,10 +6562,10 @@ function renderTrackRecordCards() {
       t.beatTheme.pct >= 60 ? 'success' : t.beatTheme.pct >= 40 ? 'info' : 'danger';
     const beatThemeStyle = beatThemeMuted ? 'color:var(--color-text-secondary)' : '';
     beatThemeCard = `
-      <div class="summary-card" title="Percentage of closed positions that beat their theme benchmark (e.g., NVDA vs SMH, AAPL vs QQQ) over the holding period. ${t.beatTheme.beat}/${t.beatTheme.totalWithTheme} beat theme. ${t.beatTheme.verdict.text}. More honest comparison than vs S&P for sleeves with theme benchmarks.">
-        <div class="summary-card-label">Beat Theme %</div>
+      <div class="summary-card" title="Percentage of closed positions that beat their industry benchmark (e.g., NVDA vs SMH, AAPL vs QQQ) over the holding period. ${t.beatTheme.beat}/${t.beatTheme.totalWithTheme} beat industry. ${t.beatTheme.verdict.text}. More honest comparison than vs S&P for sleeves with industry benchmarks.">
+        <div class="summary-card-label">Beat Industry %</div>
         <div class="summary-card-value ${beatThemeColor}" style="${beatThemeStyle}">${t.beatTheme.pct.toFixed(0)}%</div>
-        <div style="font-size:9px;color:var(--color-text-tertiary);margin-top:2px">${t.beatTheme.beat}/${t.beatTheme.totalWithTheme} beat theme</div>
+        <div style="font-size:9px;color:var(--color-text-tertiary);margin-top:2px">${t.beatTheme.beat}/${t.beatTheme.totalWithTheme} beat industry</div>
         <div style="font-size:9px;color:${beatThemeMuted?'#fbbf24':'var(--color-text-tertiary)'};margin-top:2px">${t.beatTheme.verdict.text}</div>
       </div>
     `;
@@ -6999,7 +7068,7 @@ function renderAddWatch() {
       <span style="font-size:9px;color:var(--color-text-tertiary);width:52px;flex-shrink:0">Ticker</span>
       <span style="font-size:9px;color:var(--color-text-tertiary);width:52px;flex-shrink:0">Acct</span>
       <span style="font-size:9px;color:var(--color-text-tertiary);width:80px;text-align:right;flex-shrink:0">SPX α</span>
-      <span style="font-size:9px;color:var(--color-text-tertiary);width:90px;text-align:right;flex-shrink:0">Theme α</span>
+      <span style="font-size:9px;color:var(--color-text-tertiary);width:90px;text-align:right;flex-shrink:0">Industry α</span>
       <span style="font-size:9px;color:var(--color-text-tertiary);width:44px;text-align:right;flex-shrink:0">Held</span>
       <span style="font-size:9px;color:var(--color-text-tertiary);width:44px;text-align:right;flex-shrink:0">Mgd%</span>
     </div>`;
@@ -7068,7 +7137,7 @@ function renderAddCandidatesTable() {
             <th class="r">Held</th>
             <th class="r">Managed %</th>
             <th class="r">SPX α</th>
-            <th class="r">Theme α</th>
+            <th class="r">Industry α</th>
             <th>Notes</th>
           </tr>
         </thead>
@@ -7223,7 +7292,7 @@ function renderThemeIntel() {
             <div class="industry-intel-stat-value" style="color:${alphaColor}">${t.totalAlpha !== null ? fmtDollarWhole(t.totalAlpha) : '—'}</div>
           </div>
           <div class="industry-intel-stat">
-            <div class="industry-intel-stat-label">Theme α${getThemeBenchmark(t.theme) ? ' (vs ' + getThemeBenchmark(t.theme) + ')' : ''}</div>
+            <div class="industry-intel-stat-label">Industry α${getThemeBenchmark(t.theme) ? ' (vs ' + getThemeBenchmark(t.theme) + ')' : ''}</div>
             <div class="industry-intel-stat-value" style="color:${(() => {
               const themeAlphas = open.filter(p => p.theme === t.theme).map(p => calcThemeAlpha(p));
               const valid = themeAlphas.filter(ta => ta !== null);
@@ -7260,7 +7329,7 @@ function renderThemeIntel() {
               <th style="text-align:right;padding:4px 8px;font-size:9px;color:var(--color-text-tertiary);font-weight:600;text-transform:uppercase;letter-spacing:0.08em;white-space:nowrap">% of Managed</th>
               <th style="text-align:right;padding:4px 8px;font-size:9px;color:var(--color-text-tertiary);font-weight:600;text-transform:uppercase;letter-spacing:0.08em;white-space:nowrap">Value $</th>
               <th style="text-align:right;padding:4px 8px;font-size:9px;color:var(--color-text-tertiary);font-weight:600;text-transform:uppercase;letter-spacing:0.08em;white-space:nowrap">$ Alpha</th>
-              <th style="text-align:right;padding:4px 8px;font-size:9px;color:var(--color-text-tertiary);font-weight:600;text-transform:uppercase;letter-spacing:0.08em;white-space:nowrap" title="Theme-relative alpha — your dollar gain vs theme benchmark over the same holding period.">${getThemeBenchmark(t.theme) ? 'vs ' + getThemeBenchmark(t.theme) : 'Theme α'}</th>
+              <th style="text-align:right;padding:4px 8px;font-size:9px;color:var(--color-text-tertiary);font-weight:600;text-transform:uppercase;letter-spacing:0.08em;white-space:nowrap" title="Industry-relative alpha — your dollar gain vs industry benchmark over the same holding period.">${getThemeBenchmark(t.theme) ? 'vs ' + getThemeBenchmark(t.theme) : 'Industry α'}</th>
               <th style="text-align:right;padding:4px 8px;font-size:9px;color:var(--color-text-tertiary);font-weight:600;text-transform:uppercase;letter-spacing:0.08em;white-space:nowrap">G/L</th>
               <th style="text-align:right;padding:4px 0 4px 8px;font-size:9px;color:var(--color-text-tertiary);font-weight:600;text-transform:uppercase;letter-spacing:0.08em;white-space:nowrap">Signal</th>
             </tr>
@@ -7511,12 +7580,12 @@ function updateBackfillButton() {
   const targets = findBackfillTargets();
   if (targets.length === 0) {
     btn.disabled = true;
-    btn.textContent = '⟳ Backfill Theme Benchmarks';
-    btn.title = 'All theme benchmark data current ✓';
+    btn.textContent = '⟳ Backfill Industry Benchmarks';
+    btn.title = 'All industry benchmark data current ✓';
     btn.style.opacity = '0.5';
   } else {
     btn.disabled = false;
-    btn.textContent = `⟳ Backfill Theme Benchmarks (${targets.length})`;
+    btn.textContent = `⟳ Backfill Industry Benchmarks (${targets.length})`;
     btn.title = `${targets.length} historical benchmark prices missing — click to fetch`;
     btn.style.opacity = '1';
   }
@@ -7624,7 +7693,7 @@ async function backfillThemeBenchmarks() {
   }
 
   btn.disabled = false;
-  btn.textContent = '⟳ Backfill Theme Benchmarks';
+  btn.textContent = '⟳ Backfill Industry Benchmarks';
 
   const ts = new Date().toLocaleTimeString();
   if (failed.length === 0) {
@@ -8428,7 +8497,7 @@ function calcThemeAlpha(pos) {
 //   - bestPositionPp: the most-beating per-position pp (positive number)
 //   - worstPosition: the position record producing worstPositionPp (for description text)
 //   - count: number of positions with computable theme alpha
-//   - benchTicker: the theme benchmark ticker (or null)
+//   - benchTicker: the industry benchmark ticker (or null)
 //
 // Returns null if no positions have computable theme alpha (no benchmark mapped, no backfill, etc.).
 function aggregateThemeAlpha(positionsArr) {
@@ -8788,7 +8857,7 @@ function renderTrends() {
                 <th style="text-align:left;padding:5px 8px;font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase">Ticker</th>
                 <th style="text-align:left;padding:5px 8px;font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase">Acct</th>
                 <th style="text-align:left;padding:5px 8px;font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase">Sleeve</th>
-                <th style="text-align:left;padding:5px 8px;font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase">Theme</th>
+                <th style="text-align:left;padding:5px 8px;font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase">Industry</th>
                 <th style="text-align:right;padding:5px 8px;font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase">Shares</th>
                 <th style="text-align:right;padding:5px 8px;font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase">Cost</th>
                 <th style="text-align:right;padding:5px 8px;font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase">Price</th>
@@ -10489,7 +10558,7 @@ function renderSleeveRef() {
           const taColor = totalThemeDollar > 0 ? 'var(--color-text-success)' : totalThemeDollar < 0 ? 'var(--color-text-danger)' : 'var(--color-text-tertiary)';
           const dollarStr = (totalThemeDollar >= 0 ? '+' : '') + fmtDollarWhole(totalThemeDollar);
           const ppStr = (positionPp >= 0 ? '+' : '') + positionPp.toFixed(0) + 'pp';
-          const ppTooltip = 'Position-specific percentage points: this ticker\'s return minus the theme benchmark return over the holding period. Independent of industry-aggregate weighting.';
+          const ppTooltip = 'Position-specific percentage points: this ticker\'s return minus the industry benchmark return over the holding period. Independent of industry-aggregate weighting.';
           themeAlphaInline = `<span style="font-size:9px;color:var(--color-text-tertiary);margin-left:8px">vs ${benchTicker} <span style="color:${taColor};font-weight:600">${dollarStr}</span> <span style="color:${taColor};opacity:0.85" title="${ppTooltip}">(${ppStr})</span></span>`;
         } else if (tickerLots.length > 0 && getThemeBenchmark(tickerLots[0].theme)) {
           // Theme is mapped but data missing — show placeholder
@@ -11043,7 +11112,7 @@ function _renderCardOverlay(type) {
           const taColor = totalThemeDollar > 0 ? 'var(--color-text-success)' : totalThemeDollar < 0 ? 'var(--color-text-danger)' : 'var(--color-text-tertiary)';
           const dollarStr = (totalThemeDollar >= 0 ? '+' : '') + fmtDollarWhole(totalThemeDollar);
           const ppStr = (positionPp >= 0 ? '+' : '') + positionPp.toFixed(0) + 'pp';
-          const ppTooltip = 'Position-specific pp: this ticker\'s return minus theme benchmark return over the holding period.';
+          const ppTooltip = 'Position-specific pp: this ticker\'s return minus industry benchmark return over the holding period.';
           themeAlphaCell = '<span style="color:var(--color-text-tertiary);font-size:9px">vs ' + benchTicker + '</span><br><span style="color:' + taColor + ';font-weight:600">' + dollarStr + '</span> <span style="color:' + taColor + ';opacity:0.85;font-size:10px" title="' + ppTooltip + '">(' + ppStr + ')</span>';
         } else if (tickerLots.length > 0 && getThemeBenchmark(tickerLots[0].theme)) {
           const benchTicker = getThemeBenchmark(tickerLots[0].theme);
@@ -11152,7 +11221,7 @@ function _renderCardOverlay(type) {
         const tColor = totalThemeDollar > 0 ? 'var(--color-text-success)' : 'var(--color-text-danger)';
         const dollarStr = (totalThemeDollar >= 0 ? '+' : '') + fmtDollarWhole(totalThemeDollar);
         const ppStr = (positionPp >= 0 ? '+' : '') + positionPp.toFixed(0) + 'pp';
-        const ppTooltip2 = 'Position-specific pp: this ticker\'s return minus theme benchmark return over the holding period. Differs from industry-aggregate pp (capital-weighted) shown in the header.';
+        const ppTooltip2 = 'Position-specific pp: this ticker\'s return minus industry benchmark return over the holding period. Differs from industry-aggregate pp (capital-weighted) shown in the header.';
         themeAlphaCell = '<span style="color:' + tColor + ';font-weight:600">' + dollarStr + '</span> <span style="color:' + tColor + ';opacity:0.85;font-size:10px" title="' + ppTooltip2 + '">(' + ppStr + ')</span>';
       }
 
@@ -11250,7 +11319,7 @@ function showSpotlightOverlay(signal) {
   } else if (label === 'Concentration Drift') {
     explanation = name + ' has grown to ' + pct.toFixed(1) + '% of your managed portfolio without any recent buy decisions — this growth came from price appreciation alone. You did not actively choose to increase your exposure here, but your portfolio is now more concentrated in this industry than it was when you last made a deliberate decision about it.';
   } else if (label === 'Thesis Industry Lagging') {
-    explanation = 'Your Thesis Plays sleeve generates alpha overall — meaning your conviction-driven bets are working broadly. But ' + name + ' is the dilution: trailing SPX by ' + fmtDollarWhole(Math.abs(alpha||0)) + ' AND trailing the theme benchmark. The thesis playbook is succeeding elsewhere, just not through this industry. Worth deciding whether this is a timing issue (thesis still maturing) or a signal that this industry is the wrong vehicle for the broader thesis approach.';
+    explanation = 'Your Thesis Plays sleeve generates alpha overall — meaning your conviction-driven bets are working broadly. But ' + name + ' is the dilution: trailing SPX by ' + fmtDollarWhole(Math.abs(alpha||0)) + ' AND trailing the industry benchmark. The thesis playbook is succeeding elsewhere, just not through this industry. Worth deciding whether this is a timing issue (thesis still maturing) or a signal that this industry is the wrong vehicle for the broader thesis approach.';
   } else if (label === 'Opportunity Cost') {
     explanation = name + ' has generated a real gain of ' + fmtDollarWhole(realGl) + ' — so on paper it looks positive. But the index, given the same capital on the same dates, would have returned ' + fmtDollarWhole((alpha||0) + realGl) + '. The difference — ' + fmtDollarWhole(Math.abs(alpha||0)) + ' — is what you gave up by being in ' + name + ' instead of the index. The gain is real but the opportunity cost is larger.';
   } else if (label === 'Single Position Risk') {
@@ -11291,7 +11360,7 @@ function showSpotlightOverlay(signal) {
     const themeTotal4 = themeAlphas4.length > 0 ? themeAlphas4.reduce((s,ta)=>s+ta.themeAlphaDollar,0) : null;
     const benchTicker4 = themeAlphas4.length > 0 ? themeAlphas4[0].benchTicker : null;
     explanation = name + ' looks like a winner against SPX (+' + fmtDollarWhole(alpha||0) + ') but is actually losing alpha to ' +
-      (benchTicker4 || 'the theme benchmark') + ' (' + (themeTotal4 !== null ? fmtDollarWhole(themeTotal4) : '—') + '). ' +
+      (benchTicker4 || 'the industry benchmark') + ' (' + (themeTotal4 !== null ? fmtDollarWhole(themeTotal4) : '—') + '). ' +
       'This is the most subtle drag pattern: your account statement says you\'re winning, but you\'re underperforming the easier comparison. ' +
       'The capital is producing returns, just less than a passive sector ETF would have. Worth asking whether your specific picks within this industry are earning their conviction, or whether you should have just bought the theme directly.';
   } else if (label === 'Theme Leader') {
@@ -11300,7 +11369,7 @@ function showSpotlightOverlay(signal) {
     const themeAlphas5 = themeOpen5.map(p => calcThemeAlpha(p)).filter(ta => ta !== null);
     const themeTotal5 = themeAlphas5.length > 0 ? themeAlphas5.reduce((s,ta)=>s+ta.themeAlphaDollar,0) : null;
     const benchTicker5 = themeAlphas5.length > 0 ? themeAlphas5[0].benchTicker : null;
-    explanation = name + ' is winning against ' + (benchTicker5 || 'the theme benchmark') + ' (+' +
+    explanation = name + ' is winning against ' + (benchTicker5 || 'the industry benchmark') + ' (+' +
       (themeTotal5 !== null ? fmtDollarWhole(themeTotal5) : '—') + ') but not meaningfully against SPX (' +
       fmtDollarWhole(alpha||0) + '). You\'re picking right within the sector, but the sector itself isn\'t outpacing the broad market. ' +
       'This isn\'t bad — within-theme alpha is genuine skill — but it suggests the broader sector bet may not be the right deployment of risk capital. ' +
@@ -11357,7 +11426,7 @@ function showSpotlightOverlay(signal) {
   const themeAlphaColor = themeAlphaTotal === null ? 'var(--color-text-tertiary)'
     : themeAlphaTotal >= 0 ? 'var(--color-text-success)' : 'var(--color-text-danger)';
   const benchTicker = getThemeBenchmark(name);
-  const themeAlphaLabel = benchTicker ? 'vs ' + benchTicker : 'Theme α';
+  const themeAlphaLabel = benchTicker ? 'vs ' + benchTicker : 'Industry α';
   const themePpStr = themeWeightedPp !== null
     ? ((themeWeightedPp >= 0 ? '+' : '') + themeWeightedPp.toFixed(1) + 'pp')
     : null;
@@ -11373,7 +11442,7 @@ function showSpotlightOverlay(signal) {
       '<div><div style="font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:3px">' + themeAlphaLabel + '</div><div style="font-size:18px;font-weight:700;color:' + themeAlphaColor + '">' + (themeAlphaTotal!==null?(themeAlphaTotal>=0?'+':'')+fmtDollarWhole(themeAlphaTotal):'—') + '</div>' + (themePpStr ? '<div style="font-size:10px;font-weight:600;color:' + themeAlphaColor + ';opacity:0.85;margin-top:1px" title="' + ppTooltip + '">' + themePpStr + '</div>' : '') + '</div>' +
       '<div><div style="font-size:9px;color:var(--color-text-tertiary);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:3px">G/L</div><div style="font-size:18px;font-weight:700;color:' + glColor + '">' + fmtDollarWhole(realGl) + '</div></div>' +
     '</div>' +
-    '<div style="font-size:9px;color:var(--color-text-tertiary);font-style:italic;margin-bottom:18px;padding:0 4px">Theme α aggregate is capital-weighted (dollar deficit ÷ invested capital). Per-position pp shown on individual rows reflects position-specific deviation.</div>' +
+    '<div style="font-size:9px;color:var(--color-text-tertiary);font-style:italic;margin-bottom:18px;padding:0 4px">Industry α aggregate is capital-weighted (dollar deficit ÷ invested capital). Per-position pp shown on individual rows reflects position-specific deviation.</div>' +
     '<div style="font-size:12px;line-height:1.7;color:var(--color-text-secondary)">' + explanation + '</div>';
 
   ov.style.display = 'flex';
@@ -12305,6 +12374,35 @@ const THEME_COLORS = {
 };
 
 // ─────────────────────────────────────────────
+// Auto-tag defaults (Batch 5 Phase 2)
+// Lookup table for the auto-tag card. When the user clicks "X lots need
+// tagging", positions whose ticker appears here get their missing
+// industry/strategy fields filled in. Already-tagged fields are NOT
+// overwritten. Tickers not in this map are skipped (the user has to tag
+// them manually).
+//
+// Values MUST exactly match the dropdown options in THEME_COLORS (industry)
+// and SLEEVE_COLORS (strategy). Mismatches mean the dropdown won't recognize
+// the value and the field will appear blank.
+//
+// To extend: add entries here. No UI to manage this — it's intentional
+// developer-mode state. Use sparingly; user judgment is more reliable than
+// hardcoded categories for unfamiliar tickers.
+// ─────────────────────────────────────────────
+const TICKER_DEFAULT_TAGS = {
+  'AAPL': { industry: 'Big Tech',          strategy: 'Quality' },
+  'T':    { industry: 'Fixed Income',      strategy: 'Portfolio Balance Plays' },
+  'BF.B': { industry: 'Consumer',          strategy: 'Quality' },
+  'GE':   { industry: 'Space & Defense',   strategy: 'Thesis Plays' },
+  'GEHC': { industry: 'Biotech & Health',  strategy: 'Thesis Plays' },
+  'GEV':  { industry: 'Energy & Grid',     strategy: 'Thesis Plays' },
+  'IBM':  { industry: 'Big Tech',          strategy: 'Portfolio Balance Plays' },
+  'KMI':  { industry: 'Energy & Grid',     strategy: 'Portfolio Balance Plays' },
+  'NVDA': { industry: 'AI Infrastructure', strategy: 'Thesis Plays' },
+  'VTI':  { industry: 'Broad ETF',         strategy: 'Portfolio Balance Plays' },
+};
+
+// ─────────────────────────────────────────────
 // Benchmark Map (LOCKED IN — do not adjust)
 // Locked from design session. Each theme/sleeve maps to its primary benchmark ETF.
 // "Picking flattering benchmarks defeats the purpose" — these do not change.
@@ -12787,6 +12885,7 @@ function renderAll() {
   renderCashDisplay();
   renderCapitalFlow();
   renderTaxExposure();
+  renderAutoTagCard();
   renderStaleBanner();
   updateBackfillButton();
   updateIndustryAlphaToggleVisual();
