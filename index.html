@@ -5902,6 +5902,60 @@ function evaluateListingDate(pos) {
   return bought < listed ? 'predates' : 'ok';
 }
 
+// holdPeriodInfo(pos): returns the recorded vs real hold period for a lot.
+// Used by the Batch 5 Phase 6 display (predates lots only — for non-predates
+// lots, recorded === real, no comparison needed).
+//
+// Returns { recordedYears, realYears, recordedRange, realRange, deltaYears }
+// where:
+//   recordedYears: years between dateBought and end (today or sellDate)
+//   realYears:     years between listingDate and end
+//   recordedRange: "YYYY-YYYY" string for display
+//   realRange:     "YYYY-YYYY" string for display
+//   deltaYears:    recordedYears - realYears (how much the hold period is
+//                  over-stated by the broker's bookkeeping)
+//
+// Returns null if any required field is missing or malformed. Caller should
+// only invoke this on predates lots — defensively, it works on any lot but
+// won't show interesting data for non-predates.
+//
+// Note: "real" hold period is approximated as (listingDate → end). This is
+// usually right for spinoffs (you receive the new ticker at/near its listing)
+// but isn't perfect — the actual receive date may be a few days off from
+// listing. We frame it as "since listing" in UI to be honest about the
+// approximation.
+function holdPeriodInfo(pos) {
+  if (!pos || !pos.dateBought || !pos.listingDate) return null;
+  if (!ISO_DATE_RE.test(pos.dateBought) || !ISO_DATE_RE.test(pos.listingDate)) return null;
+
+  const today = new Date().toISOString().slice(0, 10);
+  const end = pos.closed && pos.sellDate && ISO_DATE_RE.test(pos.sellDate) ? pos.sellDate : today;
+
+  const boughtMs = new Date(pos.dateBought).getTime();
+  const listedMs = new Date(pos.listingDate).getTime();
+  const endMs = new Date(end).getTime();
+  if (isNaN(boughtMs) || isNaN(listedMs) || isNaN(endMs)) return null;
+
+  const yearsBetween = function(startMs, endMs) {
+    return Math.max(0, (endMs - startMs) / (365.25 * 86400000));
+  };
+
+  const recordedYears = yearsBetween(boughtMs, endMs);
+  const realYears = yearsBetween(listedMs, endMs);
+
+  // Format range "YYYY-YYYY". For an open lot, end-year is current year.
+  const yearOf = function(d) { return d.slice(0, 4); };
+  const endYear = yearOf(end);
+
+  return {
+    recordedYears: Math.round(recordedYears * 10) / 10,
+    realYears: Math.round(realYears * 10) / 10,
+    recordedRange: yearOf(pos.dateBought) + '–' + endYear,
+    realRange: yearOf(pos.listingDate) + '–' + endYear,
+    deltaYears: Math.round((recordedYears - realYears) * 10) / 10,
+  };
+}
+
 // isLotFlagged(pos): true if this lot should display the warning UI.
 // Combines the check result with the user override. Two ways a lot ends up
 // flagged: 'predates' (Polygon detected the buy date is before listing date —
@@ -6063,17 +6117,30 @@ function tickerHasFlaggedLot(ticker, accountFilter) {
 // all three row surfaces (Trim, Sleeve Ref, Rebalance) render identically.
 function renderListingWarningBadge(ticker, accountFilter) {
   if (!tickerHasFlaggedLot(ticker, accountFilter)) return '';
-  // Count flagged lots for the tooltip
+  // Count flagged lots for the tooltip + capture a representative predates
+  // lot for hold-period reference (Batch 5 Phase 6).
   let n = 0;
+  let predatesLot = null;
   for (const p of positions) {
     if (p.closed) continue;
     if (p.ticker !== ticker) continue;
     if (accountFilter !== null && accountFilter !== undefined) {
       if ((p.account || '') !== accountFilter) continue;
     }
-    if (isLotFlagged(p)) n++;
+    if (isLotFlagged(p)) {
+      n++;
+      if (!predatesLot && p.listingDateCheck === 'predates') predatesLot = p;
+    }
   }
-  const tooltip = n + ' lot' + (n === 1 ? '' : 's') + ' predate ticker listing — returns may be misleading';
+  let tooltip = n + ' lot' + (n === 1 ? '' : 's') + ' predate ticker listing — returns may be misleading';
+  // Append real hold period info if we have a representative predates lot.
+  // Manual-flagged lots don't have a listingDate to anchor "real period" to.
+  if (predatesLot) {
+    const hp = holdPeriodInfo(predatesLot);
+    if (hp) {
+      tooltip += '. Recorded ' + hp.recordedRange + ' (' + hp.recordedYears + ' yrs); real period since listing ' + hp.realRange + ' (' + hp.realYears + ' yrs).';
+    }
+  }
   return '<span style="font-size:10px;margin-left:3px;cursor:help" title="' + tooltip + '">🚫</span>';
 }
 
@@ -6553,7 +6620,8 @@ function renderSummary(containerId, posArr, isOpen) {
       <div class="summary-card-label">Trailing S&P</div>
       <div class="summary-card-value ${s.countTrail > 0 ? 'danger' : ''}">${posArr.length > 0 ? s.countTrail : '—'}</div>
     </div>
-    ${isOpen ? renderTrackRecordCards() : ''}
+    ${/* Batch 5 Phase 6: removed Hit Rate / Beat S&P % / Beat Industry % / Avg Win-Loss cards.
+         These show '—' until you have closed-position history. Function preserved for potential restoration. */ ''}
   `;
 }
 
@@ -12105,6 +12173,15 @@ function _renderDrilldownLotBlock(pos, d, isMultiLot, idx) {
       h += '<strong>' + esc(pos.ticker || '(no ticker)') + '</strong> didn\'t begin trading until <strong>' + esc(pos.listingDate || '?') + '</strong>. ';
       h += 'This lot\'s bought-date (<strong>' + esc(pos.dateBought || '?') + '</strong>) is from a spinoff cost-basis allocation. ';
       h += 'Returns over the "hold period" are not meaningful.';
+      // Real hold period clarifier (Batch 5 Phase 6) — predates lots only.
+      // Frames "since listing" as the approximation, not "the truth".
+      const hp = holdPeriodInfo(pos);
+      if (hp) {
+        h += '<div style="margin-top:6px;font-size:10px;color:var(--color-text-tertiary)">';
+        h += 'Recorded period: <span style="color:var(--color-text-secondary)">' + hp.recordedRange + '</span> (' + hp.recordedYears + ' yrs) · ';
+        h += 'Real period since listing: <span style="color:var(--color-text-secondary)">' + hp.realRange + '</span> (' + hp.realYears + ' yrs)';
+        h += '</div>';
+      }
     }
     h += '</div>';
     h += '<a href="#" onclick="dismissListingWarning(' + pos.id + ');return false;" style="font-size:10px;color:var(--color-text-tertiary);text-decoration:underline;white-space:nowrap;flex-shrink:0" title="Suppress this warning for this lot only. Other lots of the same ticker keep their own warnings.">Dismiss warning</a>';
@@ -12128,6 +12205,13 @@ function _renderDrilldownLotBlock(pos, d, isMultiLot, idx) {
   // Lot meta line
   h += '<div style="display:flex;flex-wrap:wrap;gap:14px;font-size:11px;color:var(--color-text-secondary);margin-bottom:10px">';
   h += '<span><span style="color:var(--color-text-tertiary)">Bought</span> ' + esc(pos.dateBought || '—') + '</span>';
+  // Listed-since line for predates lots (Batch 5 Phase 6) — quick reference
+  // visible without expanding the warning. Override-suppressed predates lots
+  // still show this; it's informational and the override only affects the
+  // warning row.
+  if (pos.listingDateCheck === 'predates' && pos.listingDate) {
+    h += '<span><span style="color:var(--color-text-tertiary)">Listed</span> ' + esc(pos.listingDate) + '</span>';
+  }
   if (pos.account) h += '<span><span style="color:var(--color-text-tertiary)">Account</span> ' + esc(pos.account) + '</span>';
   h += '<span><span style="color:var(--color-text-tertiary)">Shares</span> ' + (d.shares || '—') + '</span>';
   h += '<span><span style="color:var(--color-text-tertiary)">Cost basis</span> ' + fmtDollarOrDash(d.invested) + '</span>';
