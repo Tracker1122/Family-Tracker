@@ -2933,6 +2933,12 @@ function mkPos() {
     dividendsLastFetch: null,     // ISO timestamp of last fetch attempt (success OR failure)
     dividendsFetchOk: null,       // true if last fetch succeeded; false if it failed; null if never attempted
     dividendsFormulaVersion: null,// formula version used for this lot's computation; bumped on math changes to force re-fetch
+    // Dividend data staleness flag (Batch 5 Phase 3) — set true when Polygon
+    // returns dividend records but the most recent record is more than 180
+    // days old AND this lot was held during that gap. Indicates a Polygon
+    // data gap (e.g. BF.B post-2010), not a tracker bug. Informational only;
+    // the dividendsCollected number is still computed (and under-stated).
+    dividendsDataStale: false,
     // Listing-date check (Batch 3) — flags lots whose dateBought predates the
     // ticker's actual listing date (e.g. spinoff cost-basis allocations like
     // GE → GEHC where the broker assigned the original GE buy date to the new
@@ -4930,6 +4936,9 @@ async function loadPositions() {
   // Run listing-date field migration (Batch 3, idempotent)
   migratePositionsListingFields();
 
+  // Run dividend-staleness migration (Batch 5 Phase 3, idempotent)
+  migratePositionsDividendStaleness();
+
   // Cleanup: remove fully-empty placeholder positions left over from any
   // previous seeding behaviour. Idempotent.
   cleanEmptyPlaceholders();
@@ -4991,6 +5000,22 @@ function migratePositionsListingFields() {
   });
   if (migrated > 0) {
     console.log(`Initialized listing-date fields on ${migrated} position(s)`);
+  }
+}
+
+// Schema migration: add dividend-staleness flag (Batch 5 Phase 3)
+// Idempotent. For positions missing the dividendsDataStale field, set to false.
+// Real value gets populated on next backfillDividends() run.
+function migratePositionsDividendStaleness() {
+  let migrated = 0;
+  positions.forEach(p => {
+    if (!('dividendsDataStale' in p)) {
+      p.dividendsDataStale = false;
+      migrated++;
+    }
+  });
+  if (migrated > 0) {
+    console.log(`Initialized dividendsDataStale on ${migrated} position(s)`);
   }
 }
 
@@ -7988,6 +8013,62 @@ function sumDividendsInRange(dividends, splits, startDate, endDate, shares) {
   return { total: Math.round(total * 100) / 100, count };
 }
 
+// ─────────────────────────────────────────────
+// Dividend data staleness detection (Batch 5 Phase 3)
+//
+// isDividendDataStale(dividends, lot): returns true if Polygon's dividend
+// records appear to be stale relative to this lot's hold period — i.e. the
+// most recent record is more than STALE_THRESHOLD_DAYS old AND this lot
+// was held during that gap (so there *should* have been more records).
+//
+// Catches Polygon-side data gaps where a ticker stops appearing in the
+// dividend feed despite continuing to pay. Example: BF.B has continuous
+// quarterly dividends through 2026 in reality, but Polygon's free-tier
+// dividends endpoint returns nothing after 2010-12-08 — so any BF.B lot
+// held into 2011+ would be flagged.
+//
+// Design notes:
+// - Returns false (no flag) for empty `dividends` array. That case is
+//   "ticker has no dividend history at all" (e.g. NVDA pre-2024) — handled
+//   elsewhere via `dividendsCount === 0`. Don't conflate the two.
+// - Returns false if all records are FRESH (< 180 days old). Lot is fine.
+// - Returns false if the lot was sold BEFORE the most recent record + 180
+//   days. The gap doesn't apply — lot's history is fully covered.
+// - Returns true if most recent record is stale AND lot held into the gap.
+// ─────────────────────────────────────────────
+const DIV_STALE_THRESHOLD_DAYS = 180;
+
+function isDividendDataStale(dividends, lot) {
+  if (!Array.isArray(dividends) || dividends.length === 0) return false;
+  if (!lot || !lot.dateBought) return false;
+
+  // Find most recent ex-date in the fetched records.
+  let mostRecent = '';
+  for (const d of dividends) {
+    if (d.exDate && d.exDate > mostRecent) mostRecent = d.exDate;
+  }
+  if (!mostRecent) return false;
+
+  // Compute "stale cutoff" — date beyond which a missing dividend would
+  // be suspicious. Today minus threshold. If the most recent record is
+  // newer than this, data is fresh — no flag.
+  const today = new Date().toISOString().slice(0, 10);
+  const todayMs = new Date(today).getTime();
+  const mostRecentMs = new Date(mostRecent).getTime();
+  if (isNaN(todayMs) || isNaN(mostRecentMs)) return false;
+  const daysSinceLast = (todayMs - mostRecentMs) / 86400000;
+  if (daysSinceLast <= DIV_STALE_THRESHOLD_DAYS) return false;
+
+  // Data is stale at the source. Now check: was this lot held into the gap?
+  // The gap is [mostRecent + 1 day, today]. The lot held into the gap if
+  // the lot's hold-end is AFTER mostRecent. (Open lot: hold-end = today.
+  // Closed lot: hold-end = sellDate.)
+  const lotEnd = lot.closed ? (lot.sellDate || today) : today;
+  if (!lotEnd || lotEnd <= mostRecent) return false; // sold before the gap → no flag
+
+  return true;
+}
+
 // Bulk backfill: walks every position and populates dividendsCollected.
 // Caches per-ticker dividend AND split history within a single run so
 // multiple lots of the same ticker only trigger one round of API calls.
@@ -8186,6 +8267,10 @@ async function backfillDividends() {
         // (including empty=no-splits-ever, which is fine), flag as ok.
         lot.dividendsFetchOk = !splitsErrored;
         lot.dividendsFormulaVersion = DIVIDENDS_FORMULA_VERSION;
+        // Detect Polygon-side data gaps (Batch 5 Phase 3). Set per-lot so
+        // a single ticker with a gap can flag some lots (held into the gap)
+        // but not others (sold before the gap).
+        lot.dividendsDataStale = isDividendDataStale(divResult.dividends, lot);
         lotsUpdated++;
         if (splitsErrored) {
           // Add to failed list so the user sees "X failed, click again" message.
@@ -11766,6 +11851,19 @@ function _renderDrilldownLotBlock(pos, d, isMultiLot, idx) {
     h += '</div>';
   }
 
+  // Dividend data-staleness warning (Batch 5 Phase 3)
+  // Renders when Polygon's dividend feed for this ticker is stale relative
+  // to the lot's hold period. Less alarming than the predates warning
+  // (math isn't fundamentally broken, just under-stated). Amber, not red.
+  if (pos.dividendsDataStale) {
+    h += '<div style="background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.35);border-radius:var(--border-radius-md);padding:9px 12px;margin-bottom:10px;font-size:11px;line-height:1.45;color:var(--color-text-primary)">';
+    h += '<span style="font-size:13px;margin-right:4px">⚠</span>';
+    h += '<strong>Dividend data may be incomplete.</strong> ';
+    h += 'Polygon\'s most recent dividend record for ' + esc(pos.ticker || '(no ticker)') + ' is more than 6 months old, but this lot was held during that gap. Cumulative dividends and Total Return are likely under-stated. ';
+    h += 'This is a Polygon data limitation, not a tracker bug.';
+    h += '</div>';
+  }
+
   // Lot meta line
   h += '<div style="display:flex;flex-wrap:wrap;gap:14px;font-size:11px;color:var(--color-text-secondary);margin-bottom:10px">';
   h += '<span><span style="color:var(--color-text-tertiary)">Bought</span> ' + esc(pos.dateBought || '—') + '</span>';
@@ -13249,6 +13347,8 @@ function importData(input) {
       migratePositionsV1ToV2();
       // Run listing-date field migration (Batch 3, idempotent)
       migratePositionsListingFields();
+      // Run dividend-staleness migration (Batch 5 Phase 3, idempotent)
+      migratePositionsDividendStaleness();
       await savePositions();
       restoreSpxInput();
       renderAll();
